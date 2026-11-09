@@ -1,0 +1,54 @@
+{
+ "note": "SAMPLE knowledge base. Replace with official, administrator-approved documents. Only status=approved is indexed.",
+ "documents": [
+  {
+   "file": "incubation_guidelines.md",
+   "version": "1.0",
+   "doc_type": "guidelines",
+   "status": "approved",
+   "audience": "student"
+  },
+  {
+   "file": "submission_policy.md",
+   "version": "1.0",
+   "doc_type": "deadline_resubmission_policy",
+   "status": "approved",
+   "audience": "student"
+  },
+  {
+   "file": "originality_policy.md",
+   "version": "1.0",
+   "doc_type": "originality_policy",
+   "status": "approved",
+   "audience": "student"
+  },
+  {
+   "file": "faq.md",
+   "version": "1.0",
+   "doc_type": "faq",
+   "status": "approved",
+   "audience": "student"
+  },
+  {
+   "file": "reviewer_guidelines.md",
+   "version": "1.0",
+   "doc_type": "reviewer_guidelines",
+   "status": "approved",
+   "audience": "reviewer"
+  },
+  {
+   "file": "draft_clarification.md",
+   "version": "0.1",
+   "doc_type": "clarification",
+   "status": "draft",
+   "audience": "student"
+  },
+  {
+   "file": "peer_review_guidelines.md",
+   "version": "1.0",
+   "doc_type": "reviewer_guidelines",
+   "status": "approved",
+   "audience": "reviewer"
+  }
+ ]
+}

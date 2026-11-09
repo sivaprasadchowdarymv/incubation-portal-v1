@@ -1,0 +1,4 @@
+track_id,track_name,track_description,track_keywords,ps_id,ps_title,ps_description,keywords
+AGRI,Agritech,Technology for farming,agriculture; farm; farmer; crop; soil; yield,AG-01,Precision irrigation scheduling,Reduce water use on small farms,irrigation; soil moisture; water; sensor
+AGRI,Agritech,Technology for farming,,AG-02,Early crop disease detection,Detect leaf diseases early,crop; disease; leaf; image
+HLTH,Healthcare,Accessible healthcare,health; patient; clinic; hospital; doctor,HC-01,Rural telemedicine triage,Prioritise rural patients,patient; rural; telemedicine; triage

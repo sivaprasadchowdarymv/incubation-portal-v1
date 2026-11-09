@@ -1,0 +1,15 @@
+{
+  "note": "Labeled evaluation set for the SAMPLE knowledge base. Replace together with the official KB.",
+  "items": [
+    {"q": "How many members can a team have?", "role": "student", "expected_sources": ["incubation_guidelines.md"], "answerable": true},
+    {"q": "Can we change team members after registration?", "role": "student", "expected_sources": ["incubation_guidelines.md", "faq.md"], "answerable": true},
+    {"q": "How many submission attempts does a team get?", "role": "student", "expected_sources": ["submission_policy.md"], "answerable": true},
+    {"q": "What is the submission deadline?", "role": "student", "expected_sources": ["submission_policy.md"], "answerable": true},
+    {"q": "What happens if similarity is above 50 percent?", "role": "student", "expected_sources": ["originality_policy.md", "faq.md"], "answerable": true},
+    {"q": "Which headings must the abstract contain?", "role": "student", "expected_sources": ["incubation_guidelines.md"], "answerable": true},
+    {"q": "Which file formats are accepted?", "role": "student", "expected_sources": ["incubation_guidelines.md", "submission_policy.md"], "answerable": true},
+    {"q": "How should reviewers treat common phrases from the problem statement?", "role": "reviewer", "expected_sources": ["reviewer_guidelines.md"], "answerable": true},
+    {"q": "What is the prize money for the winning team?", "role": "student", "expected_sources": [], "answerable": false},
+    {"q": "Which hotel will host the finale banquet?", "role": "student", "expected_sources": [], "answerable": false}
+  ]
+}

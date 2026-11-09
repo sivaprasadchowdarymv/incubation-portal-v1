@@ -1,0 +1,296 @@
+{
+  "version": "2026.10-pilot-2",
+  "timezone": "Asia/Kolkata",
+  "team": {
+    "min_members": 2,
+    "max_members": 3
+  },
+  "submission": {
+    "max_attempts": 3,
+    "deadline": "2026-11-30T23:59:59",
+    "deadline_inclusive": true,
+    "allowed_extensions": [
+      ".pdf",
+      ".docx",
+      ".pptx"
+    ],
+    "max_file_mb": 10,
+    "max_uncompressed_mb": 100,
+    "resubmission_precedence": [
+      "deadline",
+      "pending_review",
+      "attempts_exhausted"
+    ]
+  },
+  "validation": {
+    "min_words": 150,
+    "max_words": 5000,
+    "required_sections": {
+      "Problem Statement / Motivation": [
+        "problem statement / motivation",
+        "problem statement",
+        "motivation",
+        "problem definition",
+        "problem"
+      ],
+      "Impact": [
+        "expected impact",
+        "impact",
+        "social impact"
+      ],
+      "Methodology": [
+        "methodology",
+        "proposed methodology",
+        "method",
+        "approach"
+      ],
+      "Deliverables / Outcomes": [
+        "deliverables / outcomes",
+        "deliverables",
+        "expected outcomes",
+        "outcomes",
+        "expected deliverables"
+      ]
+    },
+    "language": {
+      "required": "en",
+      "min_stopword_ratio": 0.08,
+      "max_non_ascii_ratio": 0.3,
+      "severity": "error"
+    },
+    "relevance": {
+      "min_keyword_matches": 2,
+      "action": "review"
+    },
+    "min_words_per_section": 15,
+    "ps_similarity": {
+      "enabled": true,
+      "margin": 0.05,
+      "action": "review"
+    }
+  },
+  "similarity": {
+    "review_threshold": 0.5,
+    "shingle_size": 3,
+    "flag_methods": [
+      "lexical",
+      "exact_hash"
+    ]
+  },
+  "review": {
+    "reason_min_chars": 10,
+    "approved_rejection_policies": []
+  },
+  "rag": {
+    "top_k": 5,
+    "chunk_words": 200,
+    "chunk_overlap": 40,
+    "bm25_min_score": 0.5,
+    "semantic_min_cosine": 0.35,
+    "rrf_k": 60,
+    "min_query_coverage": 0.5
+  },
+  "awaiting_admin_confirmation": [
+    "submission.deadline",
+    "submission.deadline_inclusive",
+    "validation.min_words",
+    "validation.max_words",
+    "validation.required_sections",
+    "validation.language",
+    "validation.relevance",
+    "review.approved_rejection_policies",
+    "domains (sample catalogue)",
+    "validation.min_words_per_section",
+    "validation.relevance (min_keyword_matches, action)",
+    "validation.ps_similarity (margin, action)",
+    "duplicates.exact_action",
+    "notifications.reminder_hours_before_deadline",
+    "evaluation (rubric, weights, reviewers per submission, blind review)"
+  ],
+  "domains": [
+    {
+      "id": "AGRI",
+      "name": "Agritech",
+      "description": "Technology for farming and food systems",
+      "problem_statements": [
+        {
+          "id": "AG-01",
+          "title": "Precision irrigation scheduling",
+          "description": "Reduce water use on small farms using soil moisture sensing and weather data.",
+          "keywords": [
+            "irrigation",
+            "soil moisture",
+            "water",
+            "sensor",
+            "farm",
+            "weather",
+            "crop"
+          ]
+        },
+        {
+          "id": "AG-02",
+          "title": "Early crop disease detection",
+          "description": "Detect leaf diseases early using low-cost imaging.",
+          "keywords": [
+            "crop",
+            "disease",
+            "leaf",
+            "image",
+            "camera",
+            "farmer",
+            "detection"
+          ]
+        }
+      ],
+      "keywords": [
+        "agriculture",
+        "farm",
+        "farmer",
+        "crop",
+        "soil",
+        "irrigation",
+        "harvest",
+        "yield"
+      ]
+    },
+    {
+      "id": "HLTH",
+      "name": "Healthcare",
+      "description": "Accessible healthcare delivery",
+      "problem_statements": [
+        {
+          "id": "HC-01",
+          "title": "Rural telemedicine triage",
+          "description": "Prioritise rural patients for remote consultation.",
+          "keywords": [
+            "patient",
+            "rural",
+            "telemedicine",
+            "triage",
+            "clinic",
+            "doctor",
+            "health"
+          ]
+        }
+      ],
+      "keywords": [
+        "health",
+        "healthcare",
+        "patient",
+        "clinic",
+        "hospital",
+        "doctor",
+        "diagnosis",
+        "medical"
+      ]
+    },
+    {
+      "id": "ENER",
+      "name": "Clean Energy",
+      "description": "Affordable renewable energy",
+      "problem_statements": [
+        {
+          "id": "CE-01",
+          "title": "Solar microgrid monitoring",
+          "description": "Monitor village solar microgrids and predict faults.",
+          "keywords": [
+            "solar",
+            "microgrid",
+            "energy",
+            "battery",
+            "fault",
+            "village",
+            "monitoring"
+          ]
+        }
+      ],
+      "keywords": [
+        "energy",
+        "solar",
+        "renewable",
+        "power",
+        "electricity",
+        "battery",
+        "grid"
+      ]
+    }
+  ],
+  "duplicates": {
+    "exact_action": "fail",
+    "near_duplicate_threshold": 0.9,
+    "block_identical_resubmission": true
+  },
+  "notifications": {
+    "auto_send": true,
+    "notify_members": true,
+    "alert_reviewers": true,
+    "reminder_hours_before_deadline": [
+      168,
+      72,
+      24,
+      3
+    ],
+    "app_url": "http://127.0.0.1:8501",
+    "programme_name": "Incubation Programme Phase 1",
+    "review_reminder_hours": 24
+  },
+  "evaluation": {
+    "reviewers_per_submission": 2,
+    "review_days": 7,
+    "blind_review": true,
+    "reviewer_file_access": "assigned_only",
+    "share_scores_with_team": false,
+    "min_comment_chars": 40,
+    "disagreement_spread": 25,
+    "reminder_hours_before_due": [
+      48,
+      24
+    ],
+    "score_min": 1,
+    "score_max": 5,
+    "criteria": [
+      {
+        "id": "relevance",
+        "name": "Relevance to the problem statement",
+        "weight": 20,
+        "guide": "Does the abstract address the chosen problem statement directly?"
+      },
+      {
+        "id": "novelty",
+        "name": "Novelty / originality",
+        "weight": 20,
+        "guide": "Is the idea new, or a clear improvement on existing solutions?"
+      },
+      {
+        "id": "methodology",
+        "name": "Technical soundness & feasibility",
+        "weight": 25,
+        "guide": "Is the methodology clear, correct and achievable by this team in the programme?"
+      },
+      {
+        "id": "impact",
+        "name": "Impact & scalability",
+        "weight": 20,
+        "guide": "How large and credible is the expected social / economic impact?"
+      },
+      {
+        "id": "clarity",
+        "name": "Deliverables & clarity",
+        "weight": 15,
+        "guide": "Are deliverables concrete and measurable? Is the abstract well written?"
+      }
+    ],
+    "recommendations": [
+      "strong_accept",
+      "accept",
+      "weak_accept",
+      "weak_reject",
+      "reject"
+    ],
+    "outcomes": [
+      "shortlisted",
+      "waitlisted",
+      "not_shortlisted"
+    ]
+  }
+}

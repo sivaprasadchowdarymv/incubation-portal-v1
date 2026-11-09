@@ -1,0 +1,5 @@
+-r requirements.txt
+# automatic tests and code checks (not needed to run the portal)
+pytest>=8.0
+ruff>=0.5
+aiosmtpd>=1.4          # local SMTP server used by the email tests
