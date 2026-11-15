@@ -3,6 +3,7 @@ import argparse
 import json
 
 import _path  # noqa: F401
+
 from config.settings import get_settings, load_policy
 from rag.index import HybridIndex
 from rag.ollama import make_client

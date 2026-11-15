@@ -3,11 +3,11 @@ from __future__ import annotations
 
 import smtplib
 import ssl
-
-import requests
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
+
+import requests
 
 MAX_ATTEMPTS = 5
 DISCARDED = "Discarded by admin (never sent)"

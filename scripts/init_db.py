@@ -5,6 +5,7 @@ import getpass
 import os
 
 import _path  # noqa: F401
+
 from workflow.context import open_app
 from workflow.services import bootstrap_admin
 

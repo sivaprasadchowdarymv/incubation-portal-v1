@@ -8,6 +8,7 @@ import argparse
 import sys
 
 import _path  # noqa: F401
+
 from config.settings import ROOT
 from workflow import setup
 from workflow.context import open_app

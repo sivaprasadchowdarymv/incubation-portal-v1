@@ -98,8 +98,14 @@ class ApiChatClient:
             raise OllamaUnavailable(f"AI service not reachable ({type(exc).__name__}). Check LLM_API_KEY / LLM_MODEL.") from exc
 
 
-def make_client(s):
-    """Cloud API when LLM_API_KEY is set, otherwise local Ollama."""
-    if getattr(s, "llm_api_key", ""):
-        return ApiChatClient(s.llm_api_base, s.llm_api_key, s.llm_model)
+def make_client(s, conn=None):
+    """AI keys pasted by the admin (several, with fallback) > LLM_API_KEY from Secrets/.env > local Ollama."""
+    env_key = getattr(s, "llm_api_key", "")
+    if conn is not None:
+        from rag.providers import MultiApiChatClient, has_db_providers
+        if has_db_providers(conn):
+            extra = [{"name": "Secrets key", "base_url": s.llm_api_base, "api_key": env_key, "model": s.llm_model}] if env_key else []
+            return MultiApiChatClient(s.db_path, extra)
+    if env_key:
+        return ApiChatClient(s.llm_api_base, env_key, s.llm_model)
     return OllamaClient.from_settings(s)

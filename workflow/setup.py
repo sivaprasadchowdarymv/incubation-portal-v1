@@ -13,9 +13,9 @@ from pathlib import Path
 import pandas as pd
 
 from database.db import tx
+from notifications import service as notify
 from security.auth import User, safe_filename
 from validation import extract
-from notifications import service as notify
 from workflow.services import WorkflowError, audit, authorize, iso, now_utc
 
 
@@ -48,6 +48,7 @@ EDITABLE = {
     "submission.deadline_inclusive": "bool",
     "submission.max_file_mb": "positive_number",
     "submission.allowed_extensions": "extensions",
+    "submission.max_problem_statements_per_team": "entries",
     "validation.min_words": "positive_int",
     "validation.max_words": "positive_int",
     "validation.required_sections": "sections",
@@ -128,6 +129,10 @@ def _validate_value(kind: str, v):
         return out
     if kind == "template":
         return v
+    if kind == "entries":
+        if not 1 <= int(v) <= 5:
+            raise WorkflowError("Problem statements per team must be between 1 and 5")
+        return int(v)
     if kind == "nonneg_int":
         if int(v) < 0:
             raise WorkflowError("Value cannot be negative")
@@ -154,10 +159,14 @@ def _validate_value(kind: str, v):
         url = str(v.get("app_url", "")).strip()
         if url and not re.match(r"^https?://", url):
             raise WorkflowError("Portal address must start with http:// or https://")
+        inbox = str(v.get("query_inbox", "") or "").strip()
+        if inbox and not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", inbox):
+            raise WorkflowError("Query inbox must be a valid email address (or empty)")
         return {"auto_send": bool(v.get("auto_send", True)), "notify_members": bool(v.get("notify_members", True)),
                 "alert_reviewers": bool(v.get("alert_reviewers", True)), "reminder_hours_before_deadline": hrs,
                 "review_reminder_hours": max(0, min(int(v.get("review_reminder_hours", 24)), 24 * 14)),
-                "app_url": url, "programme_name": str(v.get("programme_name", "Incubation Programme")).strip()[:80] or "Incubation Programme"}
+                "app_url": url, "programme_name": str(v.get("programme_name", "Incubation Programme")).strip()[:80] or "Incubation Programme",
+                "query_inbox": inbox}
     if kind == "evaluation":
         from workflow.evaluation import clean_evaluation_settings
         return clean_evaluation_settings(v)

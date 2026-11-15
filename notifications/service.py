@@ -78,17 +78,22 @@ def send_deadline_reminders(conn, policy: dict, deadline: datetime, now: datetim
     sent = 0
     maxa = policy["submission"]["max_attempts"]
     for t in conn.execute("SELECT * FROM teams").fetchall():
-        last = conn.execute("SELECT status, attempt_no FROM submissions WHERE team_id=? ORDER BY attempt_no DESC LIMIT 1", (t["id"],)).fetchone()
-        if last and (last["status"] in DONE_STATES or last["status"] in WAITING_STATES):
-            continue
         if not t["ps_locked"]:
-            todo = "Your team has not yet selected and locked a track and problem statement, and has not submitted an abstract."
-        elif not last:
-            todo = "Your team has not submitted its abstract yet."
+            todo = ["Your team has not yet selected and locked a track and problem statement, and has not submitted an abstract."]
         else:
-            todo = f"Your last attempt needs corrections. You have {maxa - last['attempt_no']} attempt(s) left."
-        lines = [todo, f"The submission deadline is {deadline.strftime('%d %b %Y, %I:%M %p %Z')} — {left_txt} from now.",
-                 "Late submissions cannot be accepted."]
+            todo = []
+            for e in conn.execute("SELECT ps_id FROM team_entries WHERE team_id=? ORDER BY entry_no", (t["id"],)).fetchall():
+                last = conn.execute("SELECT status, attempt_no FROM submissions WHERE team_id=? AND ps_id=? ORDER BY attempt_no DESC LIMIT 1",
+                                    (t["id"], e["ps_id"])).fetchone()
+                if last and (last["status"] in DONE_STATES or last["status"] in WAITING_STATES):
+                    continue
+                todo.append(f"{e['ps_id']}: abstract not submitted yet." if not last else
+                            f"{e['ps_id']}: your last attempt needs corrections ({maxa - last['attempt_no']} attempt(s) left).")
+            if not todo:
+                continue
+            todo = ["Still to do for your team:"] + [f"  • {x}" for x in todo]
+        lines = todo + [f"The submission deadline is {deadline.strftime('%d %b %Y, %I:%M %p %Z')} — {left_txt} from now.",
+                        "Late submissions cannot be accepted."]
         sent += notify_team(conn, policy, t["id"], "deadline_reminder", f"Reminder: deadline in {left_txt}", lines, f"remind:{t['id']}:{h}h")
     return sent
 

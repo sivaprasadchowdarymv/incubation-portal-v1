@@ -10,15 +10,17 @@ import streamlit as st
 import cloud
 from evaluation.metrics import workflow_summary
 from notifications.outbox import count_waiting, deliver_pending, describe, send_test_email, smtp_configured
-from persist import snapshot as persist
 from notifications.service import outbox_counts, recent_failures, send_deadline_reminders, send_review_reminders
+from persist import snapshot as persist
+from rag import providers
 from rag.answer import answer
 from rag.index import HybridIndex
 from rag.ollama import make_client
 from security.auth import AuthError
 from workflow import evaluation as ev
+from workflow import queries as qs
 from workflow import services as sv
-from workflow import setup
+from workflow import setup, stats
 from workflow.context import open_app
 
 st.set_page_config(page_title="Incubation Portal", page_icon="🌱", layout="wide")
@@ -44,7 +46,7 @@ def app_ctx():
 
 conn, settings, base_policy = app_ctx()
 policy = setup.effective_policy(conn, base_policy)  # policy.json + admin-uploaded settings
-client = make_client(settings)
+client = make_client(settings, conn)
 
 
 @st.cache_data(ttl=30)
@@ -61,12 +63,23 @@ def load_index():
     return st.session_state["_idx"]
 
 
+_LAST_OK: list[str] = []   # confirmation of the last successful action in this script run
+
+
+def refresh():
+    """Rerun the page, carrying the last confirmation over so the user still sees it."""
+    if _LAST_OK:
+        st.session_state["_flash"] = _LAST_OK[-1]
+    st.rerun()
+
+
 def run(fn, *a, ok: str | None = None, **kw):
     """Call a backend service and surface its real outcome."""
     try:
         res = fn(*a, **kw)
         if ok:
             st.success(ok)
+            _LAST_OK.append(ok)
         persist.backup_soon()  # copy the change to persistent storage (no-op on PC installs)
         if smtp_configured(settings) and policy.get("notifications", {}).get("auto_send", True):
             try:  # send acknowledgements/alerts right away; failures stay queued for the worker to retry
@@ -127,10 +140,11 @@ with st.sidebar:
         st.write(f"Signed in as **{user.username}** ({user.role})")
         if st.button("Sign out"):
             st.session_state.clear()
-            st.rerun()
-    ms = model_status()
-    st.caption((f"🟢 AI: {client.chat_model} (cloud)" if ms.get("provider") == "api" else "🟢 Ollama reachable" if ms["reachable"] else "🔴 Ollama unreachable — AI features disabled, workflow still works")
-               + ("" if not ms["reachable"] else f" · chat {'✓' if ms['chat_ok'] else '✗'} · embed {'✓' if ms['embed_ok'] else '✗'}"))
+            refresh()
+    if user and user.role == "admin":  # AI status matters only to staff
+        ms = model_status()
+        st.caption((f"🟢 AI: {client.chat_model} (cloud)" if ms.get("provider") == "api" and ms["chat_ok"] else "🟢 Ollama (local AI)" if ms["reachable"]
+                    else "⚪ AI off — add a key in Programme Setup → AI keys (everything else works)"))
 
 if not user:
     st.header("Sign in")
@@ -146,7 +160,7 @@ if not user:
             else:
                 if u:
                     st.session_state["user"] = u
-                    st.rerun()
+                    refresh()
                 st.error("Invalid username or password.")
     with t2, st.form("signup"):
         un, pw = st.text_input("Choose username"), st.text_input("Choose password (min 8)", type="password")
@@ -158,7 +172,8 @@ if not user:
     st.stop()
 
 ICON = {"My Team": "👥", "Submit": "📤", "History": "🗂️", "Policy Assistant": "💬", "Review Queue": "🧑‍⚖️", "Submissions": "📄",
-        "Dashboard": "📊", "Programme Setup": "⚙️", "My Reviews": "📝", "Peer Review": "🎯", "Results": "🏅", "Users": "🔑", "Knowledge Base": "📚", "Notifications": "✉️", "Audit Log": "🧾", "Policy": "📜"}
+        "Dashboard": "📊", "Programme Setup": "⚙️", "My Reviews": "📝", "Peer Review": "🎯", "Results": "🏅",
+        "Ask the Incubation Team": "📨", "Queries": "📬", "AI Assistant": "🤖", "Users": "🔑", "Knowledge Base": "📚", "Notifications": "✉️", "Audit Log": "🧾", "Policy": "📜"}
 
 
 def left_until(dt) -> str:
@@ -191,21 +206,29 @@ def ps_card(ps: dict, track_name: str = ""):
                 st.write(line)
 
 
+STATUS_LABEL = {"ACCEPTED_FOR_EVALUATION": "✅ Accepted", "PENDING_REVIEW": "🧑‍⚖️ Under review", "REVIEW_CLEARED": "🧑‍⚖️ Under review",
+                "VALIDATING": "⏳ Checking", "SUBMITTED": "⏳ Checking", "RESUBMISSION_ALLOWED": "✏️ Fix & resubmit", "DROPPED": "⛔ Closed",
+                "DEADLINE_MISSED": "⛔ Closed", "REJECTED_BY_AUTHORIZED_REVIEW": "⛔ Not accepted", None: "Not submitted"}
+
+
 def progress_tracker(team_id):
-    """Student journey: account -> team -> problem statement -> submission -> result."""
+    """Student journey: account -> team -> problem statement(s) -> submission(s) -> result."""
     t = conn.execute("SELECT ps_locked FROM teams WHERE id=?", (team_id,)).fetchone() if team_id else None
-    last = sv.latest_submission(conn, team_id) if team_id else None
-    status = last["status"] if last else None
-    result = {"ACCEPTED_FOR_EVALUATION": "✅ Accepted", "PENDING_REVIEW": "🧑‍⚖️ Under review", "REVIEW_CLEARED": "🧑‍⚖️ Under review",
-              "RESUBMISSION_ALLOWED": "✏️ Fix & resubmit", "DROPPED": "⛔ Closed", "DEADLINE_MISSED": "⛔ Closed",
-              "REJECTED_BY_AUTHORIZED_REVIEW": "⛔ Not accepted"}.get(status, "Result")
-    res = ev.team_result(conn, policy, user) if user.role == "student" and team_id else None
+    entries = sv.team_entries(conn, team_id) if team_id else []
+    stats = [e["last_status"] for e in entries]
+    all_acc = bool(entries) and all(x == "ACCEPTED_FOR_EVALUATION" for x in stats)
+    res = ev.team_results(conn, policy, user) if user.role == "student" and team_id else []
     if res:
-        result = {"shortlisted": "🏅 Shortlisted", "waitlisted": "⏳ Waitlisted", "not_shortlisted": "Not shortlisted"}[res["outcome"]]
-    elif status == "ACCEPTED_FOR_EVALUATION":
+        result = {"shortlisted": "🏅 Shortlisted", "waitlisted": "⏳ Waitlisted", "not_shortlisted": "Not shortlisted"}[res[0]["outcome"]]
+        result += f" (+{len(res) - 1})" if len(res) > 1 else ""
+    elif all_acc:
         result = "✅ Accepted · being evaluated"
-    done = [True, bool(team_id), bool(t and t["ps_locked"]), bool(last), status == "ACCEPTED_FOR_EVALUATION"]
-    labels = ["Account", "Team registered", "Problem statement locked", "Abstract submitted", result]
+    else:
+        result = STATUS_LABEL.get(stats[0], "Result") if len(stats) == 1 and stats[0] else "Result"
+    n = len(entries)
+    done = [True, bool(team_id), bool(t and t["ps_locked"]), any(stats), all_acc]
+    labels = ["Account", "Team registered", "Problem statement locked" if n <= 1 else f"{n} problem statements locked",
+              "Abstract submitted" if n <= 1 else f"{sum(1 for x in stats if x)} of {n} abstracts submitted", result]
     now = done.index(False) if False in done else None
     cols = st.columns(5)
     for i, (c, lab) in enumerate(zip(cols, labels)):
@@ -213,13 +236,38 @@ def progress_tracker(team_id):
         c.markdown(f"<div class='step {cls}'>{'✔' if done[i] else i + 1} · {lab}</div>", unsafe_allow_html=True)
 
 
+def choose_ps(cat: list[dict], exclude: set, key: str):
+    """Track -> problem statement picker with a readable card and a searchable browser."""
+    open_cat = [dict(d, problem_statements=[p_ for p_ in d["problem_statements"] if p_["id"] not in exclude]) for d in cat]
+    open_cat = [d for d in open_cat if d["problem_statements"]]
+    if not open_cat:
+        st.info("There are no other problem statements to choose.")
+        return None, None
+    d = st.selectbox("Track (domain)", open_cat, key=f"{key}_d",
+                     format_func=lambda x: f"{x['id']} — {x['name']} ({len(x['problem_statements'])} problem statements)")
+    ps = st.selectbox("Problem statement", d["problem_statements"], key=f"{key}_p", format_func=lambda x: f"{x['id']} — {x['title']}")
+    ps_card(ps, d["name"])
+    with st.expander(f"📚 Browse all {sum(len(x['problem_statements']) for x in open_cat)} problem statements"):
+        qq = st.text_input("Search title or description", key=f"{key}_q").lower()
+        for dd in open_cat:
+            for p_ in dd["problem_statements"]:
+                if not qq or qq in (p_["title"] + " " + (p_["description"] or "")).lower():
+                    ps_card(p_, dd["name"])
+    return d, ps
+
+
 PAGES = {
-    "student": ["My Team", "Submit", "History", "Results", "Policy Assistant"],
-    "reviewer": ["My Reviews", "Review Queue", "Policy Assistant"],
-    "admin": ["Dashboard", "Programme Setup", "Review Queue", "Submissions", "Peer Review", "Users", "Knowledge Base", "Notifications", "Audit Log", "Policy"],
+    "student": ["My Team", "Submit", "History", "Results", "Ask the Incubation Team"],
+    "reviewer": ["My Reviews", "Review Queue", "Ask the Incubation Team"],
+    "admin": ["Dashboard", "Programme Setup", "Review Queue", "Submissions", "Peer Review", "Queries", "Users", "Knowledge Base",
+              "Notifications", "Audit Log", "Policy", "AI Assistant"],
 }
-page = st.sidebar.radio("Navigate", PAGES[user.role], format_func=lambda p: f"{ICON.get(p, '•')} {p}")
+_open_q = qs.counts(conn).get("open", 0) if user.role == "admin" else 0
+page = st.sidebar.radio("Navigate", PAGES[user.role],
+                        format_func=lambda p: f"{ICON.get(p, '•')} {p}" + (f" ({_open_q} open)" if p == "Queries" and _open_q else ""))
 hero()
+if _flash := st.session_state.pop("_flash", None):
+    st.success(f"✅ {_flash}")
 
 # ---------------- student pages ----------------
 if page == "My Team":
@@ -236,33 +284,44 @@ if page == "My Team":
                 members.append({"full_name": c[0].text_input(f"Member {i+1} name"), "member_ref": c[1].text_input(f"Member {i+1} ID / roll no."),
                                 "email": c[2].text_input(f"Member {i+1} email (optional)")})
             if st.form_submit_button("Register and lock team") and run(sv.register_team, conn, policy, user, name, email, members, ok="Team registered and locked."):
-                st.rerun()
+                refresh()
     else:
         t = sv.get_team(conn, user, user.team_id)
         st.subheader(f"{t['name']}  ·  {t['team_code']}  🔒")
         st.dataframe(pd.DataFrame(t["members"]), hide_index=True)
+        cat = sv.catalog(conn)
         if t["ps_locked"]:
-            ps = conn.execute("SELECT * FROM problem_statements WHERE id=?", (t["ps_id"],)).fetchone()
-            st.success(f"🔒 Locked: {t['domain_id']} / {ps['id']} — {ps['title']}")
-            ps_card(dict(ps))
+            entries = sv.team_entries(conn, user.team_id)
+            mx = sv.max_entries(policy)
+            st.markdown(f"#### 🔒 Your problem statements ({len(entries)} of {mx} allowed)")
+            st.dataframe(pd.DataFrame([{"#": e["entry_no"], "Track": e["track"], "Problem statement": f"{e['ps_id']} — {e['ps_title']}",
+                                        "Attempts used": f"{e['attempts_used']} / {policy['submission']['max_attempts']}",
+                                        "Status": STATUS_LABEL.get(e["last_status"], e["last_status"])} for e in entries]),
+                         hide_index=True, width="stretch")
+            for e in entries:
+                ps = conn.execute("SELECT * FROM problem_statements WHERE id=?", (e["ps_id"],)).fetchone()
+                with st.expander(f"{e['entry_no']}. {e['ps_id']} — {e['ps_title']}"):
+                    ps_card(dict(ps), e["track"])
+            if len(entries) < mx and sv.before_deadline(policy, sv.now_utc()):
+                with st.expander("➕ Work on another problem statement (same or another track)"):
+                    st.caption(f"Same team, same account. Each problem statement gets its own {policy['submission']['max_attempts']} attempts and its own result.")
+                    d, ps = choose_ps(cat, {e["ps_id"] for e in entries}, "add")
+                    if ps:
+                        ok = st.checkbox("I understand this addition cannot be removed later.", key="add_ok")
+                        if st.button("Add this problem statement", disabled=not ok) and run(sv.add_problem_statement, conn, policy, user, d["id"], ps["id"],
+                                                                                            ok="Added. Choose it on the 📤 Submit page."):
+                            refresh()
         else:
-            cat = sv.catalog(conn)
             if not cat:
                 st.warning("No tracks are open yet. Please check back after the administrator uploads them.")
                 st.stop()
             st.markdown("#### Choose your track and problem statement")
-            d = st.selectbox("Track (domain)", cat, format_func=lambda x: f"{x['id']} — {x['name']} ({len(x['problem_statements'])} problem statements)")
-            ps = st.selectbox("Problem statement", d["problem_statements"], format_func=lambda x: f"{x['id']} — {x['title']}")
-            ps_card(ps, d["name"])
-            with st.expander(f"📚 Browse all {sum(len(x['problem_statements']) for x in cat)} problem statements"):
-                qq = st.text_input("Search title or description").lower()
-                for dd in cat:
-                    for p_ in dd["problem_statements"]:
-                        if not qq or qq in (p_["title"] + " " + (p_["description"] or "")).lower():
-                            ps_card(p_, dd["name"])
+            if sv.max_entries(policy) > 1:
+                st.caption(f"You can add up to {sv.max_entries(policy) - 1} more problem statement(s) later, each with its own attempts.")
+            d, ps = choose_ps(cat, set(), "first")
             ok = st.checkbox("I understand this selection cannot be changed later.")
-            if st.button("Confirm and lock", disabled=not ok) and run(sv.select_problem_statement, conn, user, d["id"], ps["id"], policy=policy, ok="Selection locked."):
-                st.rerun()
+            if st.button("Confirm and lock", disabled=not (ok and ps)) and run(sv.select_problem_statement, conn, user, d["id"], ps["id"], policy=policy, ok="Selection locked."):
+                refresh()
 
 elif page == "Submit":
     st.header("Submit abstract")
@@ -270,7 +329,18 @@ elif page == "Submit":
         st.warning("Register a team first.")
         st.stop()
     progress_tracker(user.team_id)
-    okg, code, msg, used = sv.submission_gate(conn, policy, user.team_id, sv.now_utc())
+    entries = sv.team_entries(conn, user.team_id)
+    if not entries:
+        st.warning("Lock your problem statement on 👥 My Team first.")
+        st.stop()
+    if len(entries) > 1:
+        sel = st.radio("Submit for which problem statement?", entries, horizontal=True, key="sub_ps",
+                       format_func=lambda e: f"{e['ps_id']} · {STATUS_LABEL.get(e['last_status'], e['last_status'])} · {e['attempts_used']}/{policy['submission']['max_attempts']}")
+    else:
+        sel = entries[0]
+    ps_id = sel["ps_id"]
+    st.caption(f"Problem statement: **{sel['ps_id']} — {sel['ps_title']}** ({sel['track']})")
+    okg, code, msg, used = sv.submission_gate(conn, policy, user.team_id, sv.now_utc(), ps_id)
     c = st.columns(4)
     c[0].metric("Attempts used", f"{used} / {policy['submission']['max_attempts']}")
     c[1].metric("Remaining", policy["submission"]["max_attempts"] - used)
@@ -299,7 +369,7 @@ elif page == "Submit":
         dfile = st.file_uploader("Draft", type=[e.strip(".") for e in policy["submission"]["allowed_extensions"]], key=f"draft_up_{dgen}")
         if st.button("Check draft", disabled=not dfile):
             with st.spinner("Checking…"):
-                dr = run(sv.check_draft, conn, policy, user, dfile.name, dfile.getvalue(), embedder=client if model_status()["embed_ok"] else None)
+                dr = run(sv.check_draft, conn, policy, user, dfile.name, dfile.getvalue(), embedder=client if model_status()["embed_ok"] else None, ps_id=ps_id)
             if dr:
                 {"pass": st.success, "review": st.warning, "fix": st.error}[dr["verdict"]](
                     {"pass": "✅ This draft would pass all automatic checks. You can submit it below.",
@@ -315,11 +385,11 @@ elif page == "Submit":
     if st.button("Submit", disabled=not (f and confirm)):
         with st.spinner("Validating…"):
             ms = model_status()
-            rep = run(sv.submit, conn, policy, settings.storage_dir, user, f.name, f.getvalue(), embedder=client if ms["embed_ok"] else None)
+            rep = run(sv.submit, conn, policy, settings.storage_dir, user, f.name, f.getvalue(), embedder=client if ms["embed_ok"] else None, ps_id=ps_id)
         if rep:  # rerun so the attempt counters above reflect this submission
             st.session_state["last_report"] = rep
             st.session_state["uploader_gen"] = st.session_state.get("uploader_gen", 0) + 1
-            st.rerun()
+            refresh()
     if (last := st.session_state.pop("last_report", None)) is not None:
         st.subheader("Result of your submission")
         show_report(last)
@@ -339,29 +409,61 @@ elif page == "History":
     if not rows:
         st.info("No submissions yet.")
     for r in rows:
-        with st.expander(f"Attempt {r['attempt_no']} · {r['file_name']} · {r['status']}"):
+        with st.expander(f"{r['ps_id']} · attempt {r['attempt_no']} · {r['file_name']} · {STATUS_LABEL.get(r['status'], r['status'])}"):
             show_report(sv.report(conn, user, r["id"]))
 
 elif page == "Results":
-    st.header("Evaluation result")
-    res = ev.team_result(conn, policy, user)
-    if not res:
-        last = sv.latest_submission(conn, user.team_id) if user.team_id else None
-        if last and last["status"] == "ACCEPTED_FOR_EVALUATION":
-            st.info("✅ Your abstract was accepted for evaluation and is with the reviewers. You will get an email when results are released.")
+    st.header("Evaluation results")
+    results = ev.team_results(conn, policy, user)
+    done = {r["ps_id"] for r in results}
+    for e in sv.team_entries(conn, user.team_id) if user.team_id else []:
+        if e["ps_id"] in done:
+            continue
+        if e["last_status"] == "ACCEPTED_FOR_EVALUATION":
+            st.info(f"✅ {e['ps_id']}: accepted for evaluation and with the reviewers. You will get an email when results are released.")
         else:
-            st.info("Results appear here after your abstract has been evaluated and the organisers release the results.")
-    else:
-        (st.success if res["outcome"] == "shortlisted" else st.warning if res["outcome"] == "waitlisted" else st.error)(f"**{res['label']}** · abstract {res['paper']}")
-        if res["mean_score"] is not None:
-            st.metric("Average reviewer score", f"{res['mean_score']} / 100")
-        if res["note"]:
-            st.markdown("**Message from the organisers**")
-            st.write(res["note"])
-        for i, c in enumerate(res["comments"], 1):
-            with st.container(border=True):
+            st.caption(f"{e['ps_id']}: results appear here after the abstract has been evaluated and results are released.")
+    if not results and not user.team_id:
+        st.info("Results appear here after your abstract has been evaluated and the organisers release the results.")
+    for res in results:
+        with st.container(border=True):
+            (st.success if res["outcome"] == "shortlisted" else st.warning if res["outcome"] == "waitlisted" else st.error)(
+                f"**{res['label']}** · {res['ps_id']} — {res['ps_title'] or ''} · abstract {res['paper']}")
+            if res["mean_score"] is not None:
+                st.metric("Average reviewer score", f"{res['mean_score']} / 100")
+            if res["note"]:
+                st.markdown("**Message from the organisers**")
+                st.write(res["note"])
+            for i, c in enumerate(res["comments"], 1):
                 st.markdown(f"**Reviewer {i}**")
                 st.write(c)
+
+elif page == "Ask the Incubation Team":
+    st.header("📨 Ask the Incubation Team")
+    st.caption("Your message goes to the incubation team by email. You get a confirmation with a reference number, and the reply arrives by email and here.")
+    with st.form("newq", clear_on_submit=True):
+        c = st.columns([1, 2])
+        cat_q = c[0].selectbox("Topic", qs.CATEGORIES)
+        subj = c[1].text_input("Subject", max_chars=150)
+        body = st.text_area("Your message", height=160, max_chars=5000,
+                            help="Include your team code or abstract code (e.g. P-0007) if it is about a specific submission.")
+        if st.form_submit_button("Send to the incubation team", type="primary") and run(qs.send_query, conn, policy, user, cat_q, subj, body,
+                                                                                        ok="Sent. A confirmation email is on its way."):
+            pass
+    mine = qs.my_queries(conn, user)
+    if mine:
+        st.subheader(f"My queries ({len(mine)})")
+    for q in mine:
+        badge = {"open": "🟡 Waiting for reply", "answered": "🟢 Answered", "closed": "⚪ Closed"}[q["status"]]
+        with st.expander(f"{q['ref']} · {q['subject']} · {badge}", expanded=q is mine[0]):
+            for m in q["messages"]:
+                who = "🏢 Incubation team" if m["from_staff"] else "🙋 You"
+                st.markdown(f"**{who}** · {m['at'][:16].replace('T', ' ')} UTC")
+                st.write(m["body"])
+            if q["status"] != "closed":
+                fu = st.text_area("Add a message to this query", key=f"fu{q['id']}")
+                if st.button("Send", key=f"fub{q['id']}") and run(qs.follow_up, conn, policy, user, q["id"], fu, ok="Sent."):
+                    refresh()
 
 # ---------------- reviewer / admin ----------------
 elif page == "My Reviews":
@@ -372,7 +474,7 @@ elif page == "My Reviews":
             st.markdown("#### 🔒 Reviewer confidentiality pledge")
             st.write(ev.PLEDGE)
             if st.checkbox("I agree", key="pledge_ok") and st.button("Confirm pledge", type="primary") and run(ev.pledge, conn, user, ok="Thank you."):
-                st.rerun()
+                refresh()
         st.stop()
     rows = ev.my_assignments(conn, policy, user)
     if not rows:
@@ -395,12 +497,12 @@ elif page == "My Reviews":
             st.warning("Step 1 — please accept this assignment, or decline it (e.g. conflict of interest: you know the team, same department, mentor…).")
             b = st.columns(2)
             if b[0].button("✅ Accept assignment", key=f"acc{aid}") and run(ev.respond, conn, policy, user, aid, True, ok="Accepted. You can now download and review."):
-                st.rerun()
+                refresh()
             with b[1].popover("Decline / conflict of interest"):
                 why = st.text_area("Reason", key=f"why{aid}")
                 coi = st.checkbox("I have a conflict of interest with this team", key=f"coi{aid}")
                 if st.button("Decline", key=f"dec{aid}") and run(ev.respond, conn, policy, user, aid, False, why, coi, ok="Declined. The organisers were told."):
-                    st.rerun()
+                    refresh()
         try:
             fname, fdata = ev.assignment_file(conn, policy, user, aid, settings.storage_dir) if r["status"] != "assigned" else (None, None)
             if fname:
@@ -431,7 +533,7 @@ elif page == "My Reviews":
             final = b[1].form_submit_button("📨 Submit review" if cur["status"] != "submitted" else "📨 Submit revised review", type="primary", disabled=r["locked"])
             if (draft or final) and run(ev.save_review, conn, policy, user, aid, scores, rec, conf, ct, cc, final,
                                         ok="Review submitted. Thank you!" if final else "Draft saved."):
-                st.rerun()
+                refresh()
         others = ev.peer_reviews_visible_to(conn, policy, user, aid)
         if len(others) > 1:
             st.markdown("#### 💬 Other reviews of this abstract (visible after you submit yours)")
@@ -441,7 +543,7 @@ elif page == "My Reviews":
         if st.button("Declare conflict and withdraw from this abstract", key=f"coib{aid}"):
             tid = conn.execute("SELECT team_id FROM submissions WHERE id=?", (r["submission_id"],)).fetchone()[0]
             if run(ev.declare_conflict, conn, user, user.id, tid, why2, ok="Conflict recorded; the assignment was withdrawn."):
-                st.rerun()
+                refresh()
 
 elif page == "Peer Review":
     sv.authorize(conn, user, "admin", action="peer_review_page")
@@ -473,7 +575,7 @@ elif page == "Peer Review":
                 ml = cc[0].number_input("Max load", 0, 100, cur["max_load"])
                 av = cc[1].toggle("Available for new assignments", cur["available"])
                 if st.form_submit_button("Save profile") and run(ev.set_profile, conn, user, rid, exp, int(ml), av, ok="Saved."):
-                    st.rerun()
+                    refresh()
             st.markdown("**Conflicts of interest** (a conflicted reviewer is never assigned to that team; the same email as a team member is detected automatically)")
             teams = [dict(x) for x in conn.execute("SELECT id, team_code, name FROM teams ORDER BY team_code")]
             if teams:
@@ -483,7 +585,7 @@ elif page == "Peer Review":
                     ctm = cc[1].selectbox("Team", [x["id"] for x in teams], format_func=lambda i: next(f"{x['team_code']} · {x['name']}" for x in teams if x["id"] == i))
                     cwhy = cc[2].text_input("Reason")
                     if st.form_submit_button("Record conflict") and run(ev.declare_conflict, conn, user, crv, ctm, cwhy, ok="Conflict recorded."):
-                        st.rerun()
+                        refresh()
             cl = ev.conflicts(conn, user)
             if cl:
                 st.dataframe(pd.DataFrame(cl), hide_index=True, width="stretch")
@@ -499,21 +601,41 @@ elif page == "Peer Review":
                     st.success(f"{res['assigned']} assignment(s) made; reviewers were emailed.")
                     if res["short"]:
                         st.warning(f"Not enough free reviewers for: {', '.join(res['short'])}. Add reviewers or raise max load.")
-            st.markdown("**Assign manually**")
-            with st.form("assign"):
-                sid = st.selectbox("Abstract", [x["submission_id"] for x in subs],
-                                   format_func=lambda i: next(f"{x['paper']} · {x['team_code']} · {x['track']} · {x['assigned']} assigned" for x in subs if x["submission_id"] == i))
-                srow = next(x for x in subs if x["submission_id"] == sid)
-                tid = conn.execute("SELECT team_id FROM submissions WHERE id=?", (sid,)).fetchone()[0]
-                opts = [p["id"] for p in pool if p["active"]]
-                lab = {p["id"]: f"{p['username']} · load {p['load']}/{p['max_load']}" + (" · ⭐ track expert" if srow["domain_id"] in p["expertise"] else "")
-                       + (" · ⛔ conflict" if ev.conflict_reason(conn, p["id"], tid) else "") for p in pool}
-                picks = st.multiselect("Reviewers", opts, format_func=lambda i: lab[i])
-                due = st.date_input("Review due date", sv.now_utc().date() + pd.Timedelta(days=ec["review_days"]))
-                if st.form_submit_button("Assign and email reviewers"):
-                    okn = sum(bool(run(ev.assign, conn, policy, user, sid, rid, due)) for rid in picks)
+            st.markdown("#### 🎯 Assign by track → problem statement")
+            tracks_with = {}
+            for x in subs:
+                tracks_with.setdefault(x["domain_id"], []).append(x)
+            tsel = st.selectbox("1 · Track", sorted(tracks_with), key="as_track",
+                                format_func=lambda d: f"{d} — {tracks.get(d, d)} · {len(tracks_with[d])} abstract(s) · "
+                                                      f"{sum(x['needed'] > 0 and not x['decision'] for x in tracks_with[d])} need reviewers")
+            by_ps = {}
+            for x in tracks_with[tsel]:
+                by_ps.setdefault(x["ps_id"], []).append(x)
+            psel = st.selectbox("2 · Problem statement", sorted(by_ps, key=lambda k: (-sum(x["needed"] > 0 for x in by_ps[k]), k)), key="as_ps",
+                                format_func=lambda k: f"{k} — {by_ps[k][0]['ps_title'] or ''} · {len(by_ps[k])} abstract(s) · "
+                                                      f"{sum(x['needed'] > 0 and not x['decision'] for x in by_ps[k])} unassigned")
+            only_open = st.toggle("Show only abstracts that still need reviewers", True, key="as_open")
+            plist = [x for x in by_ps[psel] if not x["decision"] and (x["needed"] > 0 or not only_open)]
+            if not plist:
+                st.success("✅ Every abstract for this problem statement has its reviewers.")
+            else:
+                st.dataframe(pd.DataFrame([{"Abstract": x["paper"], "Team": x["team_code"], "Reviewers": x["reviewers"],
+                                            "Assigned": x["assigned"], "Still needed": x["needed"]} for x in plist]), hide_index=True, width="stretch")
+                sids = st.multiselect("3 · Abstract(s) to assign", [x["submission_id"] for x in plist], default=[x["submission_id"] for x in plist if x["needed"] > 0][:1],
+                                      format_func=lambda i: next(f"{x['paper']} · {x['team_code']} · needs {x['needed']}" for x in plist if x["submission_id"] == i), key="as_sids")
+                team_ids = {i: conn.execute("SELECT team_id FROM submissions WHERE id=?", (i,)).fetchone()[0] for i in sids}
+                lab = {p["id"]: f"{p['username']} · load {p['load']}/{p['max_load']}" + (" · ⭐ track expert" if tsel in p["expertise"] else "")
+                       + (" · ⛔ conflict" if any(ev.conflict_reason(conn, p["id"], tid) for tid in team_ids.values()) else "")
+                       + ("" if p["available"] else " · unavailable") for p in pool}
+                opts = sorted([p["id"] for p in pool if p["active"]], key=lambda i: (tsel not in next(p["expertise"] for p in pool if p["id"] == i),
+                                                                                      next(p["load"] for p in pool if p["id"] == i)))
+                picks = st.multiselect("4 · Reviewers (experts and least-loaded first)", opts, format_func=lambda i: lab[i], key="as_rev")
+                due = st.date_input("5 · Review due date", sv.now_utc().date() + pd.Timedelta(days=ec["review_days"]), key="as_due")
+                if st.button(f"Assign {len(picks)} reviewer(s) to {len(sids)} abstract(s) and email them", type="primary", disabled=not (sids and picks)):
+                    okn = sum(bool(run(ev.assign, conn, policy, user, sid, rid, due)) for sid in sids for rid in picks)
                     if okn:
-                        st.success(f"{okn} reviewer(s) assigned and emailed.")
+                        st.success(f"{okn} assignment(s) made; reviewers were emailed.")
+                        refresh()
     with t3:
         rows = ev.all_assignments(conn, user)
         if not rows:
@@ -531,7 +653,7 @@ elif page == "Peer Review":
                                        format_func=lambda i: next(f"{x['paper']} · {x['reviewer']} · {x['status']}" for x in openr if x["assignment_id"] == i))
                     wr = st.text_input("Reason", "reassigning")
                     if st.form_submit_button("Withdraw") and run(ev.withdraw, conn, user, wid, wr, ok="Withdrawn; the reviewer was told."):
-                        st.rerun()
+                        refresh()
                 else:
                     st.caption("Nothing open to withdraw.")
                     st.form_submit_button("Withdraw", disabled=True)
@@ -581,7 +703,7 @@ elif page == "Peer Review":
                 now_rel = st.checkbox("Email the team now (otherwise release later in tab 5, all teams at once)", False)
                 if st.form_submit_button("Record decision", type="primary") and run(ev.decide, conn, policy, user, sid, outc, note, share, now_rel,
                                                                                      ok="Decision recorded." + (" The team was emailed." if now_rel else "")):
-                    st.rerun()
+                    refresh()
     with t5:
         board = ev.leaderboard(conn, policy, user)
         if not board:
@@ -618,7 +740,7 @@ elif page == "Review Queue":
                     if not approved:
                         st.caption("No rejection policy has been approved by the administrator; rejection is unavailable.")
                     if st.form_submit_button("Record decision") and run(sv.decide, conn, policy, user, r["submission_id"], outcome, reason, pref or None, ok="Decision recorded."):
-                        st.rerun()
+                        refresh()
 
 elif page == "Submissions":
     st.header("All submissions")
@@ -659,39 +781,72 @@ elif page == "Dashboard":
         st.error("⚠️ Data is NOT being saved permanently. Add HF_TOKEN and HF_DATA_REPO to the app's Secrets (CLOUD_SETUP.md, Part D).")
     elif os.environ.get("SPACE_ID") or os.environ.get("PERSIST_DIR"):
         st.error("⚠️ Data is NOT being saved permanently: this server's disk is wiped on restart. "
-                 "Attach a Storage Bucket at /data (DEPLOYMENT.md, step 'Keep your data').")
-    m = workflow_summary(conn)
-    c = st.columns(5)
-    c[0].metric("Teams", m["teams"])
-    c[1].metric("PS locked", m["teams_ps_locked"])
-    c[2].metric("Review backlog", m["review_backlog"])
-    c[3].metric("Avg processing (ms)", m["avg_processing_ms"] or "-")
-    c[4].metric("Deadline failures", m["deadline_missed"])
-    evs = ev.evaluable(conn, user, policy)
-    if evs:
-        c = st.columns(4)
-        c[0].metric("Abstracts in peer review", len(evs))
-        c[1].metric("Waiting for reviewers", sum(x["needed"] > 0 for x in evs))
-        c[2].metric("Reviews submitted", sum(x["reviews_done"] for x in evs))
-        c[3].metric("Shortlisted", sum(x["decision"] == "shortlisted" for x in evs))
-    per_track = pd.DataFrame([dict(r) for r in conn.execute(
-        "SELECT COALESCE(d.name, 'Not chosen yet') AS track, COUNT(*) AS teams FROM teams t LEFT JOIN domains d ON d.id=t.domain_id GROUP BY 1 ORDER BY 2 DESC")])
-    if not per_track.empty:
-        st.markdown("**Teams per track**")
-        st.bar_chart(per_track.set_index("track"))
-    for title, key in [("Submissions by status", "submissions_by_status"), ("Attempt distribution", "attempt_distribution"),
-                       ("Failed checks", "failed_checks"), ("Blocked submissions (no attempt consumed)", "blocked_submissions"),
-                       ("Notifications", "notifications"), ("RAG queries by status", "rag_status")]:
-        st.markdown(f"**{title}**")
-        if m[key]:
-            st.bar_chart(pd.Series(m[key]).rename(index=str))
-        else:
-            st.caption("No data yet.")
-    st.caption(f"RAG avg latency: {m['rag_avg_latency_ms'] or '-'} ms over {m['rag_queries']} queries · state-transition errors: {m['state_transition_errors']}")
-    ev = conn.execute("SELECT name, value, labels, at FROM metrics WHERE name LIKE 'eval_%' ORDER BY id DESC LIMIT 20").fetchall()
-    if ev:
-        st.markdown("**Latest evaluation runs** (from `python scripts/evaluate.py`)")
-        st.dataframe(pd.DataFrame([dict(r) for r in ev]), hide_index=True)
+                 "Add the Space secrets HF_TOKEN and HF_DATA_REPO (HF_SETUP.md, Part D), then restart the Space.")
+    rows_all = stats.entry_rows(conn, user)
+    h = stats.headline(conn, rows_all)
+    c = st.columns(6)
+    c[0].metric("Teams", h["teams"], help=f"{h['teams_without_ps']} have not locked a problem statement yet")
+    c[1].metric("Team entries", h["entries"], help="team × problem statement")
+    c[2].metric("Submitted", h["submitted"])
+    c[3].metric("Accepted", h["accepted"])
+    c[4].metric("Reviews done", h["reviews_done"])
+    c[5].metric("Open queries", h["open_queries"])
+    if h["teams_without_ps"]:
+        st.caption(f"ℹ️ {h['teams_without_ps']} registered team(s) have not locked a problem statement and are not counted in the tables below.")
+    with st.container(border=True):
+        st.markdown("**Filters**")
+        f = st.columns([2, 2, 2, 2])
+        ftr = f[0].multiselect("Track", sorted({r["track"] for r in rows_all}), placeholder="All tracks")
+        fps = f[1].multiselect("Problem statement", sorted({r["ps_id"] for r in rows_all if not ftr or r["track"] in ftr}), placeholder="All")
+        fstg = f[2].multiselect("Stage", stats.STAGES, placeholder="All stages")
+        fdec = f[3].multiselect("Decision", list(stats.DECISIONS.values()) + ["(none yet)"], placeholder="All")
+        fq = st.text_input("Search team code, team name, abstract code or title")
+    rows = [r for r in rows_all if (not ftr or r["track"] in ftr) and (not fps or r["ps_id"] in fps) and (not fstg or r["stage"] in fstg)
+            and (not fdec or (r["decision"] or "(none yet)") in fdec)
+            and (not fq or fq.lower() in " ".join(str(r[k]) for k in ("team_code", "team_name", "paper", "ps_title", "ps_id")).lower())]
+    if not rows_all:
+        st.info("No team has locked a problem statement yet. Statistics appear here as teams register and submit.")
+    else:
+        t1, t2, t3, t4 = st.tabs(["📊 By track", "🧩 By problem statement", "📄 All entries", "🩺 System health"])
+        with t1:
+            ts = stats.track_summary(rows, policy)
+            tot = stats.totals(rows, policy, "Track")
+            df = pd.DataFrame(ts + ([tot] if len(ts) > 1 else []))
+            st.dataframe(df, hide_index=True, width="stretch",
+                         column_config={"Review completion %": st.column_config.ProgressColumn("Review completion", min_value=0, max_value=100, format="%d%%")})
+            st.download_button("⬇ Export track summary (CSV)", df.to_csv(index=False), "track_summary.csv", "text/csv")
+            chart = pd.DataFrame([{**{"Track": r["Track"]}, **{stg: r[stg] for stg in stats.STAGES}} for r in ts]).set_index("Track")
+            st.markdown("**Where every entry stands, by track**")
+            st.bar_chart(chart, horizontal=True, stack=True)
+        with t2:
+            pss = stats.ps_summary(rows, policy)
+            dfp = pd.DataFrame(pss)
+            st.dataframe(dfp, hide_index=True, width="stretch",
+                         column_config={"Review completion %": st.column_config.ProgressColumn("Review completion", min_value=0, max_value=100, format="%d%%")})
+            st.download_button("⬇ Export problem-statement summary (CSV)", dfp.to_csv(index=False), "ps_summary.csv", "text/csv")
+            pop = dfp.set_index("Problem statement")[["Entries"]].sort_values("Entries", ascending=False)
+            st.markdown("**Most chosen problem statements**")
+            st.bar_chart(pop, horizontal=True)
+        with t3:
+            dfe = pd.DataFrame([{"Abstract": r["paper"], "Track": r["track"], "PS": r["ps_id"], "Team": r["team_code"], "Team name": r["team_name"],
+                                 "Stage": r["stage"], "Attempts": r["attempts"], "Submitted": r["submitted_at"], "Reviewers": r["reviewers"],
+                                 "Reviews done": r["reviews_done"], "Avg score": r["mean_score"], "Decision": r["decision"],
+                                 "Released": "✅" if r["released"] else ""} for r in rows])
+            st.caption(f"{len(dfe)} of {len(rows_all)} entries shown")
+            st.dataframe(dfe, hide_index=True, width="stretch")
+            st.download_button("⬇ Export entries (CSV)", dfe.to_csv(index=False), "entries.csv", "text/csv")
+        with t4:
+            m = workflow_summary(conn)
+            c = st.columns(3)
+            c[0].metric("Review backlog", m["review_backlog"])
+            c[1].metric("Avg processing (ms)", m["avg_processing_ms"] or "-")
+            c[2].metric("Deadline failures", m["deadline_missed"])
+            for title, key in [("Failed checks", "failed_checks"), ("Blocked uploads (no attempt used)", "blocked_submissions"), ("Emails", "notifications")]:
+                st.markdown(f"**{title}**")
+                if m[key]:
+                    st.bar_chart(pd.Series(m[key]).rename(index=str))
+                else:
+                    st.caption("No data yet.")
 
 elif page == "Users":
     sv.authorize(conn, user, "admin", action="users_page")
@@ -702,17 +857,33 @@ elif page == "Users":
         em = st.text_input("Email (reviewers/admins receive review alerts here)")
         if st.form_submit_button("Create user"):
             run(sv.admin_create_user, conn, user, un, pw, role, em, policy, ok="User created.")
-    users_df = pd.DataFrame([dict(r) for r in conn.execute("SELECT id, username, role, email, team_id, active, created_at FROM users")])
-    st.dataframe(users_df, hide_index=True)
-    with st.form("set_email"):
-        c = st.columns([2, 3, 1])
-        uid = c[0].selectbox("User", users_df["id"].tolist(), format_func=lambda i: users_df.set_index("id").loc[i, "username"])
-        new_em = c[1].text_input("New email (empty = remove)")
-        c[2].write("")
-        if c[2].form_submit_button("Save email"):
-            if run(sv.set_user_email, conn, user, int(uid), new_em, policy, ok="Email saved."):
-                pass
-            st.rerun()
+    f = st.columns([2, 1])
+    uq = f[0].text_input("Search username, email or team")
+    ur = f[1].selectbox("Role filter", ["", "student", "reviewer", "admin"], format_func=lambda x: x or "All roles")
+    ulist = sv.list_users(conn, user, uq, ur)
+    st.dataframe(pd.DataFrame([{"Username": u["username"], "Role": u["role"], "Email": u["email"] or "", "Team": u["team_code"] or "",
+                                "Active": "✅" if u["active"] else "⛔", "Last sign-in": (u["last_login"] or "")[:16].replace("T", " "),
+                                "Created": u["created_at"][:10]} for u in ulist]), hide_index=True, width="stretch")
+    if ulist:
+        st.markdown("#### ✏️ Edit or remove a user")
+        uid = st.selectbox("User", [u["id"] for u in ulist], format_func=lambda i: next(f"{u['username']} ({u['role']})" for u in ulist if u["id"] == i))
+        cu = next(u for u in ulist if u["id"] == uid)
+        with st.form(f"edit{uid}"):
+            c = st.columns(3)
+            e_email = c[0].text_input("Email (empty = remove)", cu["email"] or "")
+            e_role = c[1].selectbox("Role", ["student", "reviewer", "admin"], index=["student", "reviewer", "admin"].index(cu["role"]))
+            e_active = c[2].toggle("Active (can sign in)", bool(cu["active"]))
+            e_pw = st.text_input("Reset password (leave empty to keep)", type="password")
+            if st.form_submit_button("Save changes", type="primary"):
+                r = run(sv.update_user, conn, policy, user, uid, email=e_email, role=e_role, active=e_active, new_password=e_pw or None)
+                if r:
+                    st.success("Saved: " + ", ".join(r["changed"]) + ". The user was emailed." if r["changed"] else "Nothing changed.")
+        with st.expander("🗑️ Remove this user"):
+            st.caption("Only accounts with no team, submissions, reviews or queries can be deleted. Others can be deactivated above "
+                       "(they can no longer sign in, and every record keeps its author).")
+            okd = st.checkbox(f"Yes, permanently delete '{cu['username']}'", key=f"del_ok{uid}")
+            if st.button("Delete user", disabled=not okd, key=f"del{uid}") and run(sv.delete_user, conn, user, uid, ok="User deleted."):
+                refresh()
 
 elif page == "Knowledge Base":
     sv.authorize(conn, user, "admin", action="kb_page")
@@ -736,7 +907,7 @@ elif page == "Knowledge Base":
         knew = c[1].selectbox("Set status", ["approved", "draft", "retired"])
         c[2].write("")
         if c[2].button("Update status") and run(setup.set_kb_status, conn, user, settings.kb_dir, kfile, knew, ok="Status updated. Rebuild the index."):
-            st.rerun()
+            refresh()
     st.markdown("**Models**")
     st.json(model_status())
     stale = HybridIndex.needs_rebuild(settings.kb_dir, settings.index_dir)
@@ -753,7 +924,56 @@ elif page == "Programme Setup":
     sv.authorize(conn, user, "admin", action="programme_setup")
     st.header("Programme setup")
     st.caption(f"Active rules version: {policy['version']}. Changes apply immediately to new submissions; earlier submissions keep the version they were checked with.")
-    t1, t2, t3, t4, t5, t6 = st.tabs(["Tracks & problem statements", "Abstract format / template", "Deadline & rules", "Validation checks", "Emails & reminders", "Peer review rubric"])
+    t1, t2, t3, t4, t5, t6, t7 = st.tabs(["Tracks & problem statements", "Abstract format / template", "Deadline & rules", "Validation checks",
+                                          "Emails & reminders", "Peer review rubric", "AI keys"])
+    with t7:
+        st.markdown("Paste API keys from one or more AI providers. They are used **in this order**; when one is busy or fails, the next "
+                    "takes over automatically and the failing one rests for a minute. Free keys: Groq, Google Gemini, OpenRouter, Hugging Face, "
+                    "Mistral, Cerebras. Keys are stored in your private data and shown only as their last 4 characters.")
+        provs = providers.list_providers(conn, user)
+        if provs:
+            st.dataframe(pd.DataFrame([{"#": i + 1, "Name": p_["name"], "Model": p_["model"], "Key": p_["api_key"], "On": "✅" if p_["enabled"] else "⏸",
+                                        "Last OK": (p_["last_ok_at"] or "")[:16].replace("T", " "), "Last error": (p_["last_error"] or "")[:60],
+                                        "Resting until": (p_["cooldown_until"] or "")[11:19]} for i, p_ in enumerate(provs)]), hide_index=True, width="stretch")
+            pid = st.selectbox("Manage", [p_["id"] for p_ in provs], format_func=lambda i: next(f"{p_['name']} · {p_['model']}" for p_ in provs if p_["id"] == i))
+            cur = next(p_ for p_ in provs if p_["id"] == pid)
+            b = st.columns(5)
+            if b[0].button("🧪 Test"):
+                okp, msgp = providers.test_provider(conn, user, pid)
+                (st.success if okp else st.error)(msgp)
+            if b[1].button("⬆ Up"):
+                providers.move_provider(conn, user, pid, True)
+                refresh()
+            if b[2].button("⬇ Down"):
+                providers.move_provider(conn, user, pid, False)
+                refresh()
+            if b[3].button("⏸ Pause" if cur["enabled"] else "▶ Use"):
+                providers.update_provider(conn, user, pid, enabled=not cur["enabled"])
+                refresh()
+            if b[4].button("🗑 Remove"):
+                providers.delete_provider(conn, user, pid)
+                refresh()
+            with st.form(f"provupd{pid}"):
+                c = st.columns(2)
+                nm = c[0].text_input("Change model", cur["model"])
+                nk = c[1].text_input("Replace key (optional)", type="password")
+                if st.form_submit_button("Save") and run(providers.update_provider, conn, user, pid, model=nm, api_key=nk or None, ok="Saved."):
+                    refresh()
+        else:
+            st.info("No AI keys yet. Without a key, the portal works fully; only AI-drafted query replies and the staff AI assistant are off.")
+        st.markdown("**➕ Add a key**")
+        preset = st.selectbox("Provider", list(providers.PRESETS), key="prov_preset")
+        base_u, model_u, where = providers.PRESETS[preset]
+        if where:
+            st.caption(f"Get a key at {where}")
+        with st.form("provadd", clear_on_submit=True):
+            c = st.columns(3)
+            pn = c[0].text_input("Name", preset if "Custom" not in preset else "")
+            pb = c[1].text_input("API address (OpenAI-compatible)", base_u)
+            pm = c[2].text_input("Model", model_u)
+            pk = st.text_input("API key", type="password")
+            if st.form_submit_button("Add key", type="primary") and run(providers.add_provider, conn, user, pn, pb, pk, pm, ok="Key added. Click Test to check it."):
+                refresh()
     with t6:
         ec = policy["evaluation"]
         st.markdown("How accepted abstracts are evaluated by reviewers (like a conference programme committee).")
@@ -780,7 +1000,7 @@ elif page == "Programme Setup":
                                share_scores_with_team=share, disagreement_spread=float(spread), reminder_hours_before_due=hrs,
                                criteria=[{kk: ("" if pd.isna(vv) else vv) for kk, vv in r.items()} for r in crit.to_dict("records")])
                     if run(setup.update_settings, conn, user, {"evaluation": new}, base_policy, ok="Peer-review settings saved."):
-                        st.rerun()
+                        refresh()
     with t1:
         st.markdown("Upload a **CSV, Excel (.xlsx) or JSON** file with one row per problem statement. "
                     "Required columns: `track_id, track_name, ps_id, ps_title`; optional: `track_description, ps_description, keywords` (separate keywords with `;`).")
@@ -826,24 +1046,27 @@ elif page == "Programme Setup":
         if st.button("Save template and format rules", disabled=not tup):
             if run(setup.save_template, conn, user, base_policy, settings.storage_dir, tup.name, tup.getvalue(), setup.sections_from_text(sec_text),
                    int(mn), int(mx), fmts, settings.kb_dir, ok="Template and format rules saved."):
-                st.rerun()
+                refresh()
         if not tup and st.button("Save format rules only (keep current template)"):
             if run(setup.update_settings, conn, user, {"validation.required_sections": setup.sections_from_text(sec_text), "validation.min_words": int(mn),
                    "validation.max_words": int(mx), "submission.allowed_extensions": fmts}, base_policy, ok="Format rules saved."):
                 setup.publish_template_doc(setup.effective_policy(conn, base_policy), settings.kb_dir)
-                st.rerun()
+                refresh()
     with t3:
         with st.form("rules"):
             dl = st.text_input(f"Submission deadline ({policy['timezone']}, format YYYY-MM-DDTHH:MM:SS)", policy["submission"]["deadline"])
             incl = st.checkbox("Accept submissions at exactly the deadline second", policy["submission"].get("deadline_inclusive", True))
             mb = st.number_input("Maximum file size (MB)", 0.1, 100.0, float(policy["submission"]["max_file_mb"]))
+            mxe = st.number_input("Problem statements one team may work on (each with its own attempts)", 1, 5,
+                                  int(policy["submission"].get("max_problem_statements_per_team", 1)))
             rp = st.text_area("Approved rejection policies, one per line as `ID | title` (empty = reviewers cannot reject)",
                               "\n".join(f"{p['id']} | {p['title']}" for p in policy["review"]["approved_rejection_policies"]))
             if st.form_submit_button("Save rules"):
                 pols = [{"id": a.strip(), "title": b.strip()} for a, _, b in (ln.partition("|") for ln in rp.splitlines() if ln.strip())]
                 if run(setup.update_settings, conn, user, {"submission.deadline": dl.strip(), "submission.deadline_inclusive": incl,
-                       "submission.max_file_mb": mb, "review.approved_rejection_policies": pols}, base_policy, ok="Rules saved."):
-                    st.rerun()
+                       "submission.max_file_mb": mb, "submission.max_problem_statements_per_team": int(mxe),
+                       "review.approved_rejection_policies": pols}, base_policy, ok="Rules saved."):
+                    refresh()
 
     with t4:
         v = policy["validation"]
@@ -876,7 +1099,7 @@ elif page == "Programme Setup":
                         "validation.ps_similarity": {"enabled": pe, "margin": pm, "action": pa},
                         "duplicates": {"exact_action": da, "near_duplicate_threshold": nd or None, "block_identical_resubmission": bi}},
                        base_policy, ok="Checks saved."):
-                    st.rerun()
+                    refresh()
     with t5:
         nc = policy.get("notifications", {})
         st.write("Email:", f"✅ {describe(settings)}" if smtp_configured(settings)
@@ -884,6 +1107,7 @@ elif page == "Programme Setup":
         with st.form("notif"):
             name = st.text_input("Programme name (email signature)", nc.get("programme_name", "Incubation Programme"))
             url = st.text_input("Portal address included in emails", nc.get("app_url", "http://127.0.0.1:8501"))
+            qin = st.text_input("Incubation inbox for student/reviewer queries (also emailed to every admin; optional)", nc.get("query_inbox", ""))
             c = st.columns(3)
             auto = c[0].checkbox("Send immediately after each action", nc.get("auto_send", True))
             mem = c[1].checkbox("Email every team member (not only the contact)", nc.get("notify_members", True))
@@ -898,8 +1122,8 @@ elif page == "Programme Setup":
                     st.error("Reminder hours must be whole numbers, e.g. 168, 72, 24, 3")
                 if hl is not None and run(setup.update_settings, conn, user, {"notifications": {
                         "programme_name": name, "app_url": url, "auto_send": auto, "notify_members": mem, "alert_reviewers": rev,
-                        "reminder_hours_before_deadline": hl, "review_reminder_hours": int(rrh)}}, base_policy, ok="Email settings saved."):
-                    st.rerun()
+                        "reminder_hours_before_deadline": hl, "review_reminder_hours": int(rrh), "query_inbox": qin}}, base_policy, ok="Email settings saved."):
+                    refresh()
         st.caption("Reminders go to teams that have not locked a problem statement, not submitted, or must resubmit. "
                    "Run `python scripts/notify_worker.py --loop 300` so reminders and retries happen automatically.")
 
@@ -941,7 +1165,7 @@ elif page == "Notifications":
                 n = run(sv.discard_waiting_emails, conn, user)
                 if n:
                     st.success(f"{n} email(s) discarded.")
-                    st.rerun()
+                    refresh()
     if c[1].button("Queue due reminders now"):
         n = send_deadline_reminders(conn, policy, sv.deadline(policy), sv.now_utc())
         r = send_review_reminders(conn, policy, sv.now_utc())
@@ -987,8 +1211,61 @@ elif page == "Policy":
         st.write(f"Marked {run(sv.sweep_deadlines, conn, policy, user)} submission(s) DEADLINE_MISSED.")
     st.json({k: v for k, v in policy.items() if not k.startswith("_")})
 
-elif page == "Policy Assistant":
-    st.header("Policy assistant")
+elif page == "Queries":
+    st.header("📬 Queries from students and reviewers")
+    cnt = qs.counts(conn)
+    c = st.columns(4)
+    c[0].metric("Waiting for reply", cnt.get("open", 0))
+    c[1].metric("Answered", cnt.get("answered", 0))
+    c[2].metric("Closed", cnt.get("closed", 0))
+    c[3].metric("Inbox copy to", policy.get("notifications", {}).get("query_inbox") or "admins only")
+    f = st.columns(3)
+    fst = f[0].selectbox("Status", ["open", "answered", "closed", ""], format_func=lambda x: {"": "All", "open": "Waiting for reply"}.get(x, x.title()))
+    fcat = f[1].selectbox("Topic", [""] + qs.CATEGORIES, format_func=lambda x: x or "All topics")
+    fq = f[2].text_input("Search (subject, user, team, text)")
+    rows = qs.inbox(conn, user, fst, fcat, fq)
+    if not rows:
+        st.info("No queries match.")
+        st.stop()
+    st.dataframe(pd.DataFrame([{"Ref": r["ref"], "Status": r["status"], "Topic": r["category"], "Subject": r["subject"], "From": r["username"],
+                                "Role": r["role"], "Team": r["team_code"] or "", "Messages": r["n_messages"], "Updated": r["updated_at"][:16].replace("T", " ")}
+                               for r in rows]), hide_index=True, width="stretch")
+    qid = st.selectbox("Open a query", [r["id"] for r in rows], format_func=lambda i: next(f"{r['ref']} · {r['subject']} · {r['username']}" for r in rows if r["id"] == i))
+    q = next(r for r in rows if r["id"] == qid)
+    with st.container(border=True):
+        st.markdown(f"**{q['ref']} · {q['subject']}**  \n{q['category']} · from **{q['username']}** ({q['role']}{', team ' + q['team_code'] if q['team_code'] else ''})"
+                    f" · {q['email'] or 'no email on file'}")
+        for m in qs.thread(conn, user, qid):
+            st.markdown(f"**{'🏢 ' + (m['author'] or 'staff') if m['from_staff'] else '🙋 ' + (m['author'] or '')}** · {m['at'][:16].replace('T', ' ')} UTC")
+            st.write(m["body"])
+    key = f"qreply{qid}"
+    if st.button("✨ Draft a reply with AI (from the knowledge base)", disabled=not model_status()["chat_ok"]):
+        idx = load_index()
+        if idx is None:
+            st.warning("Rebuild the knowledge-base index first (📚 Knowledge Base).")
+        else:
+            with st.spinner("Drafting…"):
+                d = run(qs.ai_draft, conn, user, qid, idx, client, policy["rag"])
+            if d:
+                st.session_state[key] = d
+    if not model_status()["chat_ok"]:
+        st.caption("AI drafting needs an AI key: ⚙️ Programme Setup → AI keys.")
+    txt = st.text_area("Your reply (emailed to the sender)", key=key, height=200)
+    b = st.columns(4)
+    if b[0].button("Send reply", type="primary") and run(qs.reply, conn, policy, user, qid, txt, ok="Reply sent."):
+        st.session_state.pop(key, None)
+        refresh()
+    if b[1].button("Send and close") and run(qs.reply, conn, policy, user, qid, txt, True, ok="Reply sent and query closed."):
+        st.session_state.pop(key, None)
+        refresh()
+    if q["status"] != "closed" and b[2].button("Close without reply") and run(qs.set_status, conn, user, qid, "closed", ok="Closed."):
+        refresh()
+    if q["status"] == "closed" and b[3].button("Reopen") and run(qs.set_status, conn, user, qid, "open", ok="Reopened."):
+        refresh()
+
+elif page == "AI Assistant":
+    st.header("🤖 AI assistant (staff only)")
+    st.caption("Ask questions about the programme rules; answers come from the approved knowledge base with citations.")
     idx = load_index()
     if idx is None:
         st.warning("Knowledge-base index is missing or stale. An administrator must run `python scripts/ingest.py`.")

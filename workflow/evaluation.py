@@ -93,8 +93,8 @@ def _is_staff_reviewer(conn, uid: int):
 
 
 def _sub(conn, sid: int):
-    s = conn.execute("SELECT s.*, t.team_code, t.name AS team_name, t.domain_id, d.name AS track, p.title AS ps_title "
-                     "FROM submissions s JOIN teams t ON t.id=s.team_id LEFT JOIN domains d ON d.id=t.domain_id "
+    s = conn.execute("SELECT s.*, t.team_code, t.name AS team_name, p.domain_id, d.name AS track, p.title AS ps_title "
+                     "FROM submissions s JOIN teams t ON t.id=s.team_id LEFT JOIN problem_statements p0 ON p0.id=s.ps_id LEFT JOIN domains d ON d.id=p0.domain_id "
                      "LEFT JOIN problem_statements p ON p.id=s.ps_id WHERE s.id=?", (sid,)).fetchone()
     if not s:
         raise WorkflowError("Submission not found")
@@ -204,8 +204,8 @@ def evaluable(conn, admin: User, policy: dict) -> list[dict]:
     k = cfg(policy)["reviewers_per_submission"]
     out = []
     for s in conn.execute("SELECT s.id, s.team_id, s.ps_id, s.attempt_no, s.file_name, s.submitted_at, t.team_code, t.name AS team_name, "
-                          "t.domain_id, d.name AS track, p.title AS ps_title FROM submissions s JOIN teams t ON t.id=s.team_id "
-                          "LEFT JOIN domains d ON d.id=t.domain_id LEFT JOIN problem_statements p ON p.id=s.ps_id "
+                          "p.domain_id, d.name AS track, p.title AS ps_title FROM submissions s JOIN teams t ON t.id=s.team_id "
+                          "LEFT JOIN problem_statements p ON p.id=s.ps_id LEFT JOIN domains d ON d.id=p.domain_id "
                           "WHERE s.status='ACCEPTED_FOR_EVALUATION' ORDER BY s.id"):
         rows = conn.execute("SELECT a.status, u.username, a.due_at FROM review_assignments a JOIN users u ON u.id=a.reviewer_id "
                             "WHERE a.submission_id=? ORDER BY a.id", (s["id"],)).fetchall()
@@ -354,6 +354,9 @@ def respond(conn, policy: dict, reviewer: User, assignment_id: int, accept: bool
     if accept:
         conn.execute("UPDATE review_assignments SET status='accepted', responded_at=? WHERE id=?", (now, assignment_id))
         audit(conn, reviewer, "assignment_accepted", "submission", a["submission_id"])
+        notify.notify_user(conn, policy, reviewer.id, "assignment_accept_ack", f"Assignment confirmed: {paper_code(a['submission_id'])}",
+                           [f"Thank you for accepting abstract {paper_code(a['submission_id'])}.", f"Review due: {_fmt(a['due_at'])}.",
+                            "Download it from 📝 My Reviews, score the rubric and submit your comments."], f"acceptack:{assignment_id}")
         return
     reason = (reason or "").strip()
     if len(reason) < 5:
@@ -384,6 +387,9 @@ def pledge(conn, reviewer: User) -> None:
     authorize(conn, reviewer, "reviewer", action="confidentiality_pledge")
     if not has_pledged(conn, reviewer.id):
         audit(conn, reviewer, "reviewer_confidentiality_pledge", "user", reviewer.id, {"text": PLEDGE})
+        notify.notify_user(conn, None, reviewer.id, "pledge_ack", "Confidentiality pledge recorded",
+                           ["Thank you. Your confidentiality pledge has been recorded:", PLEDGE, "", "You can now open the abstracts assigned to you."],
+                           f"pledgeack:{reviewer.id}")
 
 
 def assignment_file(conn, policy: dict, reviewer: User, assignment_id: int, storage_dir: Path | None = None) -> tuple[str, bytes]:
@@ -463,6 +469,13 @@ def save_review(conn, policy: dict, reviewer: User, assignment_id: int, scores: 
         notify.notify_user(conn, policy, reviewer.id, "review_submitted_ack", f"Review received: {p}" + (f" (revision {rev})" if rev > 1 else ""),
                            [f"Thank you — your review of {p} has been recorded.", f"Weighted score: {total}/100 · Recommendation: {REC_LABEL[recommendation]}",
                             "You can revise it until the organisers record a decision."], f"reviewack:{rid}:{rev}")
+        if rev == 1 and not conn.execute("SELECT 1 FROM review_assignments WHERE reviewer_id=? AND status IN ('assigned','accepted')",
+                                         (reviewer.id,)).fetchone():
+            done = conn.execute("SELECT COUNT(*) FROM review_assignments WHERE reviewer_id=? AND status='submitted'", (reviewer.id,)).fetchone()[0]
+            notify.notify_user(conn, policy, reviewer.id, "reviews_all_done", "All your assigned reviews are complete — thank you",
+                               [f"You have submitted all {done} review(s) assigned to you. Thank you for your time and care.",
+                                "You can still revise a review until the organisers record a decision.",
+                                "If more abstracts are assigned to you, you will receive a new email."], f"alldone:{reviewer.id}:{done}")
         k = cfg(policy)["reviewers_per_submission"]
         n_done = conn.execute("SELECT COUNT(*) FROM peer_reviews WHERE submission_id=? AND status='submitted'", (a["submission_id"],)).fetchone()[0]
         n_open = conn.execute("SELECT COUNT(*) FROM review_assignments WHERE submission_id=? AND status IN ('assigned','accepted')", (a["submission_id"],)).fetchone()[0]
@@ -582,21 +595,30 @@ def leaderboard(conn, policy: dict, admin: User) -> list[dict]:
     return rows
 
 
-def team_result(conn, policy: dict, student: User) -> dict | None:
-    """What a team sees after release: outcome, organiser note, anonymised reviewer comments (never scores of individuals or confidential notes)."""
+def team_results(conn, policy: dict, student: User) -> list[dict]:
+    """Released results for every problem statement of the team: outcome, organiser note, anonymised reviewer comments
+    (never individual scores or confidential notes). Newest first."""
     from workflow.services import refresh_user
     u = refresh_user(conn, student)
     if not u.team_id:
-        return None
-    d = conn.execute("SELECT d.* FROM evaluation_decisions d JOIN evaluation_releases r ON r.decision_id=d.id WHERE d.team_id=? ORDER BY d.id DESC LIMIT 1",
-                     (u.team_id,)).fetchone()
-    if not d or d["id"] != conn.execute("SELECT MAX(id) FROM evaluation_decisions WHERE submission_id=?", (d["submission_id"],)).fetchone()[0]:
-        return None
-    comments = [r["comments_team"] for r in conn.execute("SELECT comments_team FROM peer_reviews WHERE submission_id=? AND status='submitted' ORDER BY id",
-                                                           (d["submission_id"],))] if d["share_comments"] else []
-    return {"outcome": d["outcome"], "label": OUTCOME_LABEL[d["outcome"]], "note": d["note_to_team"],
-            "mean_score": d["mean_score"] if cfg(policy).get("share_scores_with_team") else None,
-            "comments": [c for c in comments if c], "paper": paper_code(d["submission_id"])}
+        return []
+    out = []
+    for d in conn.execute("SELECT d.*, s.ps_id, p.title AS ps_title FROM evaluation_decisions d JOIN evaluation_releases r ON r.decision_id=d.id "
+                          "JOIN submissions s ON s.id=d.submission_id LEFT JOIN problem_statements p ON p.id=s.ps_id "
+                          "WHERE d.team_id=? AND d.id=(SELECT MAX(id) FROM evaluation_decisions x WHERE x.submission_id=d.submission_id) "
+                          "ORDER BY d.id DESC", (u.team_id,)).fetchall():
+        comments = [r["comments_team"] for r in conn.execute("SELECT comments_team FROM peer_reviews WHERE submission_id=? AND status='submitted' ORDER BY id",
+                                                               (d["submission_id"],))] if d["share_comments"] else []
+        out.append({"outcome": d["outcome"], "label": OUTCOME_LABEL[d["outcome"]], "note": d["note_to_team"],
+                    "mean_score": d["mean_score"] if cfg(policy).get("share_scores_with_team") else None,
+                    "comments": [c for c in comments if c], "paper": paper_code(d["submission_id"]), "ps_id": d["ps_id"], "ps_title": d["ps_title"]})
+    return out
+
+
+def team_result(conn, policy: dict, student: User) -> dict | None:
+    """The team's most recent released result (see team_results for all of them)."""
+    res = team_results(conn, policy, student)
+    return res[0] if res else None
 
 
 # ---------------- reminders (called by the email worker) ----------------

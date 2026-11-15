@@ -1,5 +1,6 @@
 """Write synthetic sample abstracts to samples/ for manual UI testing (no personal data)."""
 import _path  # noqa: F401
+
 from config.settings import ROOT
 from evaluation import synthetic as sy
 

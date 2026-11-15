@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import _path  # noqa: F401
+
 from workflow import setup
 from workflow.context import open_app
 from workflow.services import User

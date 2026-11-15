@@ -8,9 +8,9 @@ import json
 import time
 
 import _path  # noqa: F401
+
 from notifications.worker import one_pass
 from workflow.context import open_app
-
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()

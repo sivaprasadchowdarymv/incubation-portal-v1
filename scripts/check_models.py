@@ -2,6 +2,7 @@
 import json
 
 import _path  # noqa: F401
+
 from config.settings import get_settings
 from rag.ollama import make_client
 

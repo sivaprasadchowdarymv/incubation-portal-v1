@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 import _path  # noqa: F401
+
 from config.settings import ROOT, get_settings
 
 ap = argparse.ArgumentParser()

@@ -265,7 +265,58 @@ CREATE TRIGGER eval_decisions_no_update BEFORE UPDATE ON evaluation_decisions BE
 CREATE TRIGGER eval_decisions_no_delete BEFORE DELETE ON evaluation_decisions BEGIN SELECT RAISE(ABORT, 'decisions are a permanent record'); END;
 """
 
-MIGRATIONS: list[tuple[int, str]] = [(1, SCHEMA_V1), (2, SCHEMA_V2), (3, SCHEMA_V3), (4, SCHEMA_V4), (5, SCHEMA_V5)]
+SCHEMA_V6 = """
+CREATE TABLE team_entries (
+  id INTEGER PRIMARY KEY,
+  team_id INTEGER NOT NULL REFERENCES teams(id),
+  domain_id TEXT NOT NULL REFERENCES domains(id),
+  ps_id TEXT NOT NULL REFERENCES problem_statements(id),
+  entry_no INTEGER NOT NULL,
+  locked_at TEXT NOT NULL,
+  locked_by INTEGER REFERENCES users(id),
+  UNIQUE (team_id, ps_id),
+  UNIQUE (team_id, entry_no)
+);
+INSERT INTO team_entries(team_id, domain_id, ps_id, entry_no, locked_at)
+  SELECT id, domain_id, ps_id, 1, COALESCE(ps_locked_at, created_at) FROM teams WHERE ps_locked=1 AND ps_id IS NOT NULL AND domain_id IS NOT NULL;
+CREATE TRIGGER team_entries_no_delete BEFORE DELETE ON team_entries BEGIN SELECT RAISE(ABORT, 'locked problem statements cannot be removed'); END;
+CREATE TABLE queries (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  team_id INTEGER REFERENCES teams(id),
+  category TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('open','answered','closed')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX ix_queries_status ON queries(status, updated_at);
+CREATE TABLE query_messages (
+  id INTEGER PRIMARY KEY,
+  query_id INTEGER NOT NULL REFERENCES queries(id),
+  author_id INTEGER REFERENCES users(id),
+  from_staff INTEGER NOT NULL DEFAULT 0,
+  body TEXT NOT NULL,
+  at TEXT NOT NULL
+);
+CREATE TRIGGER query_messages_no_update BEFORE UPDATE ON query_messages BEGIN SELECT RAISE(ABORT, 'messages are a permanent record'); END;
+CREATE TRIGGER query_messages_no_delete BEFORE DELETE ON query_messages BEGIN SELECT RAISE(ABORT, 'messages are a permanent record'); END;
+CREATE TABLE ai_providers (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  base_url TEXT NOT NULL,
+  api_key TEXT NOT NULL,
+  model TEXT NOT NULL,
+  position INTEGER NOT NULL DEFAULT 0,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  last_ok_at TEXT,
+  last_error TEXT,
+  cooldown_until TEXT
+);
+"""
+
+MIGRATIONS: list[tuple[int, str]] = [(1, SCHEMA_V1), (2, SCHEMA_V2), (3, SCHEMA_V3), (4, SCHEMA_V4), (5, SCHEMA_V5), (6, SCHEMA_V6)]
 
 
 def connect(path: str | Path) -> sqlite3.Connection:

@@ -2,6 +2,7 @@
 import json
 
 import _path  # noqa: F401
+
 from config.settings import ROOT
 from evaluation.evaluate import rag_eval, workflow_eval
 from rag.index import HybridIndex

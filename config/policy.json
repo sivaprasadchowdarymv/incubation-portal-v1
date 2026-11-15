@@ -20,7 +20,8 @@
       "deadline",
       "pending_review",
       "attempts_exhausted"
-    ]
+    ],
+    "max_problem_statements_per_team": 2
   },
   "validation": {
     "min_words": 150,

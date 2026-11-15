@@ -37,6 +37,8 @@ def secrets_to_env(st) -> None:
         os.environ["INCUB_ADMIN_PASSWORD"] = os.environ["ADMIN_PASSWORD"]
     if os.environ.get("PUBLIC_URL") and not os.environ.get("INCUB_PUBLIC_URL"):
         os.environ["INCUB_PUBLIC_URL"] = os.environ["PUBLIC_URL"]
+    if os.environ.get("SPACE_HOST") and not os.environ.get("INCUB_PUBLIC_URL"):   # Hugging Face sets e.g. you-portal.hf.space
+        os.environ["INCUB_PUBLIC_URL"] = "https://" + os.environ["SPACE_HOST"]
 
 
 def enabled() -> bool:

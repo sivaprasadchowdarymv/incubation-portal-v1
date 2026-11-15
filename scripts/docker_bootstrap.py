@@ -9,6 +9,7 @@ import sys
 import time
 
 import _path  # noqa: F401
+
 from rag.index import HybridIndex
 from rag.ollama import make_client
 from workflow.context import open_app

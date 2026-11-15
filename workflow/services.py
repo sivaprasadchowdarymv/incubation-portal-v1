@@ -4,13 +4,13 @@ All business rules are enforced here (never only in the UI)."""
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 import re
 import sqlite3
 import time
 import uuid
-import hmac
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -55,7 +55,14 @@ def audit(conn, user: User | None, action: str, entity_type: str | None = None, 
 
 
 def authorize(conn, user: User | None, *roles: str, action: str = "") -> User:
+    """Role check against the database, so a deactivated account or a changed role takes effect immediately."""
     try:
+        if user is not None:
+            r = conn.execute("SELECT role, active FROM users WHERE id=?", (user.id,)).fetchone()
+            if not r or not r["active"]:
+                raise AuthError("This account is not active. Contact the incubation office.")
+            if r["role"] != user.role:
+                user = User(user.id, user.username, r["role"], user.team_id)
         return require_role(user, *roles)
     except AuthError:
         if not conn.in_transaction:
@@ -152,6 +159,110 @@ def set_user_email(conn, admin: User, user_id: int, email: str | None, policy: d
         notify.notify_user(conn, policy, user_id, "email_confirmed", "Email address registered for notifications",
                            ["This address will now receive notifications from the incubation portal.",
                             "If you did not expect this, contact the incubation office."], f"emailset:{user_id}:{now_utc().strftime('%Y%m%d%H%M%S')}")
+
+
+def list_users(conn, admin: User, search: str = "", role: str = "") -> list[dict]:
+    authorize(conn, admin, "admin", action="list_users")
+    sql = ("SELECT u.id, u.username, u.role, u.email, u.active, u.created_at, t.team_code, "
+           "(SELECT MAX(at) FROM audit_events a WHERE a.actor_id=u.id AND a.action='login_success') AS last_login "
+           "FROM users u LEFT JOIN teams t ON t.id=u.team_id WHERE 1=1")
+    args: list = []
+    if role:
+        sql += " AND u.role=?"
+        args.append(role)
+    if search:
+        sql += " AND (u.username LIKE ? OR u.email LIKE ? OR t.team_code LIKE ?)"
+        args += [f"%{search}%"] * 3
+    return [dict(r) for r in conn.execute(sql + " ORDER BY u.role, u.username", args)]
+
+
+def _active_admins(conn) -> int:
+    return conn.execute("SELECT COUNT(*) FROM users WHERE role='admin' AND active=1").fetchone()[0]
+
+
+def update_user(conn, policy: dict | None, admin: User, user_id: int, *, email: str | None = None, role: str | None = None,
+                active: bool | None = None, new_password: str | None = None) -> dict:
+    """Edit an account. Safety rules: you cannot demote or deactivate yourself, the last active admin stays,
+    students who belong to a team keep the student role, reviewers with open assignments keep the reviewer role."""
+    authorize(conn, admin, "admin", action="update_user")
+    u = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    if not u:
+        raise WorkflowError("User not found")
+    changes: dict = {}
+    if email is not None:
+        email = email.strip() or None
+        if email and not EMAIL.match(email):
+            raise WorkflowError("Invalid email address.")
+        if email != u["email"]:
+            changes["email"] = email
+    if role is not None and role != u["role"]:
+        if role not in ("student", "reviewer", "admin"):
+            raise WorkflowError("Invalid role")
+        if user_id == admin.id:
+            raise WorkflowError("You cannot change your own role.")
+        if u["role"] == "admin" and u["active"] and _active_admins(conn) <= 1:
+            raise WorkflowError("This is the last active admin; create another admin first.")
+        if u["team_id"]:
+            raise WorkflowError("This student belongs to a team, so the role cannot be changed.")
+        if u["role"] == "reviewer" and conn.execute("SELECT 1 FROM review_assignments WHERE reviewer_id=? AND status IN ('assigned','accepted')", (user_id,)).fetchone():
+            raise WorkflowError("This reviewer has open assignments; withdraw them first (🎯 Peer Review → Progress).")
+        changes["role"] = role
+    if active is not None and bool(active) != bool(u["active"]):
+        if not active:
+            if user_id == admin.id:
+                raise WorkflowError("You cannot deactivate your own account.")
+            if u["role"] == "admin" and _active_admins(conn) <= 1:
+                raise WorkflowError("This is the last active admin; create another admin first.")
+        changes["active"] = int(bool(active))
+    if new_password:
+        try:
+            changes["pw_hash"] = hash_password(new_password)
+        except ValueError as exc:
+            raise WorkflowError(str(exc)) from None
+    if not changes:
+        return {"changed": []}
+    with tx(conn):
+        conn.execute(f"UPDATE users SET {', '.join(k + '=?' for k in changes)} WHERE id=?", (*changes.values(), user_id))
+        if changes.get("active") == 0 and u["role"] == "reviewer":
+            conn.execute("UPDATE review_assignments SET status='withdrawn', note='reviewer deactivated', responded_at=? "
+                         "WHERE reviewer_id=? AND status IN ('assigned','accepted')", (iso(now_utc()), user_id))
+        audit(conn, admin, "user_updated", "user", user_id, {k: ("***" if k == "pw_hash" else v) for k, v in changes.items()})
+    said = {"email": "your email address was updated", "role": f"your role is now {changes.get('role')}",
+            "active": "your account was " + ("re-activated" if changes.get("active") else "deactivated"),
+            "pw_hash": "your password was reset by an administrator (you will receive the new password separately)"}
+    notify.notify_user(conn, policy, user_id, "account_updated", "Your portal account was updated",
+                       ["An administrator changed your account:"] + [f"  • {said[k]}" for k in changes] +
+                       ["", "If you did not expect this, contact the incubation office."], f"userupd:{user_id}:{now_utc().strftime('%Y%m%d%H%M%S%f')}")
+    return {"changed": [k.replace("pw_hash", "password") for k in changes]}
+
+
+def delete_user(conn, admin: User, user_id: int) -> None:
+    """Remove an account that has no history. Accounts with a team, submissions, reviews or queries are deactivated instead,
+    so that every record keeps its author."""
+    authorize(conn, admin, "admin", action="delete_user")
+    u = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    if not u:
+        raise WorkflowError("User not found")
+    if user_id == admin.id:
+        raise WorkflowError("You cannot delete your own account.")
+    if u["role"] == "admin" and u["active"] and _active_admins(conn) <= 1:
+        raise WorkflowError("This is the last active admin; create another admin first.")
+    used = u["team_id"] or any(conn.execute(q, (user_id,)).fetchone() for q in (
+        "SELECT 1 FROM teams WHERE created_by=?", "SELECT 1 FROM submissions WHERE submitted_by=?",
+        "SELECT 1 FROM review_assignments WHERE reviewer_id=?", "SELECT 1 FROM review_assignments WHERE assigned_by=?",
+        "SELECT 1 FROM peer_reviews WHERE reviewer_id=?", "SELECT 1 FROM review_decisions WHERE reviewer_id=?",
+        "SELECT 1 FROM evaluation_decisions WHERE decided_by=?", "SELECT 1 FROM queries WHERE user_id=?"))
+    if used:
+        raise WorkflowError(f"'{u['username']}' has a team, submissions, reviews or queries, so the account cannot be deleted. "
+                            "Deactivate it instead: the person can no longer sign in and all records are kept.")
+    try:
+        with tx(conn):
+            conn.execute("DELETE FROM reviewer_profiles WHERE user_id=?", (user_id,))
+            conn.execute("DELETE FROM reviewer_conflicts WHERE reviewer_id=?", (user_id,))
+            conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+            audit(conn, admin, "user_deleted", "user", user_id, {"username": u["username"], "role": u["role"]})
+    except sqlite3.IntegrityError:
+        raise WorkflowError(f"'{u['username']}' is linked to other records; deactivate the account instead.") from None
 
 
 def bootstrap_admin(conn, username: str, password: str) -> int | None:
@@ -284,6 +395,8 @@ def select_problem_statement(conn, user: User, domain_id: str, ps_id: str, polic
         if t["ps_locked"]:
             raise WorkflowError("Domain and problem statement are already locked.")
         conn.execute("UPDATE teams SET domain_id=?, ps_id=?, ps_locked=1, ps_locked_at=? WHERE id=?", (domain_id, ps_id, iso(now_utc()), user.team_id))
+        conn.execute("INSERT OR IGNORE INTO team_entries(team_id, domain_id, ps_id, entry_no, locked_at, locked_by) VALUES (?,?,?,1,?,?)",
+                     (user.team_id, domain_id, ps_id, iso(now_utc()), user.id))
         audit(conn, user, "ps_locked", "team", user.team_id, {"domain": domain_id, "ps": ps_id})
         if policy is not None:
             dname = conn.execute("SELECT name FROM domains WHERE id=?", (domain_id,)).fetchone()["name"]
@@ -291,6 +404,68 @@ def select_problem_statement(conn, user: User, domain_id: str, ps_id: str, polic
                                [f"Track: {dname} ({domain_id})", f"Problem statement: {ps_id} — {ps['title']}",
                                 f"This selection is final. Submit your abstract before {deadline(policy).strftime('%d %b %Y, %I:%M %p %Z')}."],
                                f"pslock:{user.team_id}")
+
+
+def max_entries(policy: dict) -> int:
+    return max(1, int(policy.get("submission", {}).get("max_problem_statements_per_team", 1) or 1))
+
+
+def team_entries(conn, team_id: int) -> list[dict]:
+    """Every problem statement a team is working on, with its own attempts and latest status."""
+    out = []
+    for r in conn.execute("SELECT e.*, p.title AS ps_title, d.name AS track FROM team_entries e JOIN problem_statements p ON p.id=e.ps_id "
+                          "JOIN domains d ON d.id=e.domain_id WHERE e.team_id=? ORDER BY e.entry_no", (team_id,)):
+        last = latest_submission(conn, team_id, r["ps_id"])
+        out.append(dict(r) | {"attempts_used": attempts_used(conn, team_id, r["ps_id"]), "last_status": last["status"] if last else None,
+                              "last_submission_id": last["id"] if last else None})
+    return out
+
+
+def add_problem_statement(conn, policy: dict, user: User, domain_id: str, ps_id: str, now: datetime | None = None) -> int:
+    """Same team, same account: work on one more problem statement (same or another track). Each has its own attempts."""
+    authorize(conn, user, "student", action="add_ps")
+    user = refresh_user(conn, user)
+    now = now or now_utc()
+    if not user.team_id:
+        raise WorkflowError("Register a team first.")
+    team = conn.execute("SELECT * FROM teams WHERE id=?", (user.team_id,)).fetchone()
+    if not team["ps_locked"]:
+        raise WorkflowError("Lock your first problem statement before adding another.")
+    if not before_deadline(policy, now):
+        raise WorkflowError("The submission deadline has passed; no new problem statements can be added.")
+    ps = conn.execute("SELECT * FROM problem_statements WHERE id=? AND active=1", (ps_id,)).fetchone()
+    if not ps:
+        raise WorkflowError("Unknown problem statement.")
+    if ps["domain_id"] != domain_id:
+        raise WorkflowError("The selected problem statement does not belong to the selected track.")
+    with tx(conn):
+        rows = conn.execute("SELECT ps_id, entry_no FROM team_entries WHERE team_id=?", (user.team_id,)).fetchall()
+        if any(r["ps_id"] == ps_id for r in rows):
+            raise WorkflowError("Your team already works on this problem statement.")
+        if len(rows) >= max_entries(policy):
+            raise WorkflowError(f"A team can work on at most {max_entries(policy)} problem statement(s).")
+        no = max((r["entry_no"] for r in rows), default=0) + 1
+        eid = conn.execute("INSERT INTO team_entries(team_id, domain_id, ps_id, entry_no, locked_at, locked_by) VALUES (?,?,?,?,?,?)",
+                           (user.team_id, domain_id, ps_id, no, iso(now), user.id)).lastrowid
+        audit(conn, user, "ps_added", "team", user.team_id, {"domain": domain_id, "ps": ps_id, "entry": no})
+    dname = conn.execute("SELECT name FROM domains WHERE id=?", (domain_id,)).fetchone()["name"]
+    notify.notify_team(conn, policy, user.team_id, "ps_added_ack", f"Problem statement {no} of {max_entries(policy)} added",
+                       [f"Your team now also works on: {ps_id} — {ps['title']} (track: {dname}).",
+                        f"It has its own {policy['submission']['max_attempts']} submission attempts.",
+                        f"Choose it on the Submit page and submit before {deadline(policy).strftime('%d %b %Y, %I:%M %p %Z')}."],
+                       f"psadd:{user.team_id}:{ps_id}")
+    return eid
+
+
+def _maybe_team_complete(conn, policy: dict, team_id: int) -> None:
+    """Completion acknowledgement: every problem statement of the team now has an accepted abstract."""
+    entries = team_entries(conn, team_id)
+    if entries and all(e["last_status"] == "ACCEPTED_FOR_EVALUATION" for e in entries):
+        notify.notify_team(conn, policy, team_id, "submission_complete", "Your Phase 1 submission is complete",
+                           ["All your abstracts are accepted for evaluation:"] +
+                           [f"  • {e['ps_id']} — {e['ps_title']} (attempt {e['attempts_used']})" for e in entries] +
+                           ["", "Nothing more is needed from your team now. Reviewers will evaluate the abstracts and you will be emailed the results."],
+                           f"teamdone:{team_id}:{len(entries)}")
 
 
 # ---------------- deadlines & attempts ----------------
@@ -309,17 +484,22 @@ def attempts_used(conn, team_id: int, ps_id: str | None) -> int:
     return conn.execute("SELECT COUNT(*) FROM submissions WHERE team_id=? AND ps_id IS ?", (team_id, ps_id)).fetchone()[0]
 
 
-def latest_submission(conn, team_id: int):
-    return conn.execute("SELECT * FROM submissions WHERE team_id=? ORDER BY attempt_no DESC LIMIT 1", (team_id,)).fetchone()
+def latest_submission(conn, team_id: int, ps_id: str | None = None):
+    if ps_id:
+        return conn.execute("SELECT * FROM submissions WHERE team_id=? AND ps_id=? ORDER BY attempt_no DESC, id DESC LIMIT 1", (team_id, ps_id)).fetchone()
+    return conn.execute("SELECT * FROM submissions WHERE team_id=? ORDER BY id DESC LIMIT 1", (team_id,)).fetchone()
 
 
-def submission_gate(conn, policy: dict, team_id: int, now: datetime) -> tuple[bool, str, str, int]:
-    """Decide whether a new formal attempt may be created. Precedence is configured in policy."""
+def submission_gate(conn, policy: dict, team_id: int, now: datetime, ps_id: str | None = None) -> tuple[bool, str, str, int]:
+    """Decide whether a new formal attempt may be created for one of the team's problem statements."""
     t = conn.execute("SELECT * FROM teams WHERE id=?", (team_id,)).fetchone()
     if not t["ps_locked"]:
         return False, "PS_NOT_LOCKED", "Select and lock your domain and problem statement first.", 0
-    used = attempts_used(conn, team_id, t["ps_id"])
-    last = latest_submission(conn, team_id)
+    ps_id = ps_id or t["ps_id"]
+    if not conn.execute("SELECT 1 FROM team_entries WHERE team_id=? AND ps_id=?", (team_id, ps_id)).fetchone():
+        return False, "PS_NOT_LOCKED", "This problem statement is not one of your team's locked problem statements.", 0
+    used = attempts_used(conn, team_id, ps_id)
+    last = latest_submission(conn, team_id, ps_id)
     status = last["status"] if last else None
     maxa = policy["submission"]["max_attempts"]
     rules = {
@@ -366,7 +546,8 @@ def _after_failure_state(conn, policy: dict, sub, now: datetime) -> tuple[str, s
 
 # ---------------- submissions ----------------
 
-def submit(conn, policy: dict, storage_dir: Path, user: User, file_name: str, data: bytes, now: datetime | None = None, embedder=None) -> dict:
+def submit(conn, policy: dict, storage_dir: Path, user: User, file_name: str, data: bytes, now: datetime | None = None, embedder=None,
+           ps_id: str | None = None) -> dict:
     authorize(conn, user, "student", action="submit")
     user = refresh_user(conn, user)
     if not user.team_id:
@@ -384,7 +565,9 @@ def submit(conn, policy: dict, storage_dir: Path, user: User, file_name: str, da
                            f"refused:{user.team_id}:{code}:{hashlib.sha256(data or b'').hexdigest()[:12]}:{now.strftime('%Y%m%d%H%M%S%f')}")
         raise SubmissionBlocked(code, msg)
 
-    ok, code, msg, _ = submission_gate(conn, policy, user.team_id, now)
+    if not ps_id:
+        ps_id = conn.execute("SELECT ps_id FROM teams WHERE id=?", (user.team_id,)).fetchone()["ps_id"]
+    ok, code, msg, _ = submission_gate(conn, policy, user.team_id, now, ps_id)
     if not ok:
         blocked(code, msg)
     pre = extract.precheck(safe, data, policy)
@@ -392,25 +575,25 @@ def submit(conn, policy: dict, storage_dir: Path, user: User, file_name: str, da
         blocked(pre.code, pre.message)
     if policy.get("duplicates", {}).get("block_identical_resubmission", True):
         fsha = hashlib.sha256(data).hexdigest()
-        prev = conn.execute("SELECT attempt_no, file_sha256, text_hash FROM submissions WHERE team_id=?", (user.team_id,)).fetchall()
+        prev = conn.execute("SELECT attempt_no, ps_id, file_sha256, text_hash FROM submissions WHERE team_id=?", (user.team_id,)).fetchall()
         if prev:
             ex0 = extract.extract(safe, data)
             th = checks.normalize_hash(ex0.text) if ex0.text else None
             same = next((r for r in prev if r["file_sha256"] == fsha or (th and r["text_hash"] == th)), None)
             if same:
-                blocked("DUPLICATE_OF_PREVIOUS_ATTEMPT", f"This document is identical to your attempt {same['attempt_no']}. "
+                blocked("DUPLICATE_OF_PREVIOUS_ATTEMPT", f"This document is identical to your attempt {same['attempt_no']} for {same['ps_id']}. "
                         "Make the corrections from that report before resubmitting. No attempt was used.")
 
     team = conn.execute("SELECT * FROM teams WHERE id=?", (user.team_id,)).fetchone()
     path: Path | None = None
     try:
         with tx(conn):  # BEGIN IMMEDIATE: serialises concurrent attempt creation
-            ok, code, msg, used = submission_gate(conn, policy, user.team_id, now)
+            ok, code, msg, used = submission_gate(conn, policy, user.team_id, now, ps_id)
             if not ok:
                 raise SubmissionBlocked(code, msg)
             cur = conn.execute(
                 "INSERT INTO submissions(team_id,ps_id,attempt_no,status,file_name,file_sha256,policy_version,submitted_by,submitted_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                (team["id"], team["ps_id"], used + 1, "SUBMITTED", safe, hashlib.sha256(data).hexdigest(), policy["version"], user.id, iso(now)))
+                (team["id"], ps_id, used + 1, "SUBMITTED", safe, hashlib.sha256(data).hexdigest(), policy["version"], user.id, iso(now)))
             sid = cur.lastrowid
             folder = Path(storage_dir) / "uploads" / f"team_{team['id']}"
             folder.mkdir(parents=True, exist_ok=True)
@@ -430,15 +613,17 @@ def submit(conn, policy: dict, storage_dir: Path, user: User, file_name: str, da
 
     notify.notify_team(conn, policy, team["id"], "submission_ack", f"Submission received (attempt {used + 1} of {policy['submission']['max_attempts']})",
                        [f"We received '{safe}' at {now.astimezone(deadline(policy).tzinfo).strftime('%d %b %Y, %I:%M %p %Z')} as attempt {used + 1}.",
+                        f"Problem statement: {ps_id}",
                         "Automatic checks are running; you will receive the result shortly."], f"recv:{sid}")
     _transition(conn, sid, "VALIDATING", None, "validation started")
-    return _validate(conn, policy, user, team, sid, safe, data, now, t0, embedder)
+    return _validate(conn, policy, user, team, sid, safe, data, now, t0, embedder, ps_id)
 
 
 DRAFT_CHECKS_PER_DAY = 20
 
 
-def check_draft(conn, policy: dict, user: User, file_name: str, data: bytes, now: datetime | None = None, embedder=None) -> dict:
+def check_draft(conn, policy: dict, user: User, file_name: str, data: bytes, now: datetime | None = None, embedder=None,
+                ps_id: str | None = None) -> dict:
     """Run the same automatic checks on a draft WITHOUT creating a submission or using an attempt. Nothing is stored."""
     authorize(conn, user, "student", action="check_draft")
     user = refresh_user(conn, user)
@@ -456,7 +641,10 @@ def check_draft(conn, policy: dict, user: User, file_name: str, data: bytes, now
     if not pre.ok:
         return {"verdict": "fix", "results": [{"check_id": pre.code, "result": "fail", "severity": "error", "message": pre.message,
                                                "evidence": "", "guidance": "", "review_flag": False}], "word_count": 0, "checks_left": DRAFT_CHECKS_PER_DAY - used - 1}
-    ps = dict(conn.execute("SELECT * FROM problem_statements WHERE id=?", (team["ps_id"],)).fetchone())
+    ps_id = ps_id or team["ps_id"]
+    if not conn.execute("SELECT 1 FROM team_entries WHERE team_id=? AND ps_id=?", (team["id"], ps_id)).fetchone():
+        raise WorkflowError("This problem statement is not one of your team's locked problem statements.")
+    ps = dict(conn.execute("SELECT * FROM problem_statements WHERE id=?", (ps_id,)).fetchone())
     ps["keywords"] = json.loads(ps["keywords"])
     trow = conn.execute("SELECT * FROM domains WHERE id=?", (ps["domain_id"],)).fetchone()
     track = dict(trow) | {"keywords": json.loads(trow["keywords"])}
@@ -473,8 +661,8 @@ def check_draft(conn, policy: dict, user: User, file_name: str, data: bytes, now
             "checks_left": DRAFT_CHECKS_PER_DAY - used - 1}
 
 
-def _validate(conn, policy, user, team, sid, safe, data, now, t0, embedder) -> dict:
-    ps = dict(conn.execute("SELECT * FROM problem_statements WHERE id=?", (team["ps_id"],)).fetchone())
+def _validate(conn, policy, user, team, sid, safe, data, now, t0, embedder, ps_id=None) -> dict:
+    ps = dict(conn.execute("SELECT * FROM problem_statements WHERE id=?", (ps_id or team["ps_id"],)).fetchone())
     ps["keywords"] = json.loads(ps["keywords"])
     trow = conn.execute("SELECT * FROM domains WHERE id=?", (ps["domain_id"],)).fetchone()
     track = dict(trow) | {"keywords": json.loads(trow["keywords"])}
@@ -510,7 +698,7 @@ def _validate(conn, policy, user, team, sid, safe, data, now, t0, embedder) -> d
                     "DROPPED": "All attempts have been used; the team cannot submit again.",
                     "DEADLINE_MISSED": "The deadline has passed; no further attempts are possible."}[nxt]
         notify.notify_team(conn, policy, team["id"], "validation_failed", f"Attempt {att} did not pass the checks",
-                           [f"Your attempt {att} ('{safe}') did not pass these checks:"] + notify.checks_summary(conn, sid) + ["", nxt_line], f"fail:{sid}")
+                           [f"Your attempt {att} ('{safe}') for {ps['id']} did not pass these checks:"] + notify.checks_summary(conn, sid) + ["", nxt_line], f"fail:{sid}")
         if any(r.check_id == "DUPLICATE_SUBMISSION" for r in errors):
             orig = [f["compared_submission_id"] for f in findings if f["method"] == "exact_hash"]
             notify.notify_staff(conn, policy, ("admin",), "duplicate_alert", f"Duplicate submission rejected: {team['team_code']} attempt {att}",
@@ -530,8 +718,10 @@ def _validate(conn, policy, user, team, sid, safe, data, now, t0, embedder) -> d
     else:
         _transition(conn, sid, "ACCEPTED_FOR_EVALUATION", None, "all checks passed")
         notify.notify_team(conn, policy, team["id"], "accepted", "Abstract accepted for evaluation",
-                           [f"Your attempt {att} ('{safe}') passed all Phase 1 checks and is accepted for evaluation.", "No further action is needed."],
+                           [f"Your attempt {att} ('{safe}') for {ps['id']} — {ps['title']} passed all Phase 1 checks and is accepted for evaluation.",
+                            "No further action is needed for this problem statement."],
                            f"accept:{sid}")
+        _maybe_team_complete(conn, policy, team["id"])
     ms = (time.perf_counter() - t0) * 1000
     conn.execute("UPDATE submissions SET processing_ms=? WHERE id=?", (ms, sid))
     metrics.record(conn, "submission_processing_ms", ms, {"submission": sid})
@@ -690,6 +880,8 @@ def decide(conn, policy: dict, user: User, submission_id: int, outcome: str, rea
     notify.notify_team(conn, policy, team["id"], "review_decision", f"Review outcome: {outcome.replace('_', ' ')}",
                        [f"A reviewer has decided on attempt {sub['attempt_no']}: {outcome.replace('_', ' ').upper()}.", f"Reason: {reason}", "", nxt],
                        f"decision:{submission_id}")
+    if final == "ACCEPTED_FOR_EVALUATION":
+        _maybe_team_complete(conn, policy, team["id"])
     notify.notify_user(conn, policy, user.id, "decision_ack", f"Decision recorded: {team['team_code']} submission #{submission_id}",
                        [f"Your decision '{outcome.replace('_', ' ')}' for submission #{submission_id} (team {team['team_code']}) was recorded.",
                         f"Reason: {reason}"] + ([f"Policy reference: {policy_ref}"] if policy_ref else []) + ["The team has been notified."],
@@ -706,7 +898,8 @@ def sweep_deadlines(conn, policy: dict, admin: User, now: datetime | None = None
     if before_deadline(policy, now):
         return 0
     n = 0
-    for r in conn.execute("SELECT id, team_id, attempt_no FROM submissions s WHERE status='RESUBMISSION_ALLOWED' AND attempt_no=(SELECT MAX(attempt_no) FROM submissions x WHERE x.team_id=s.team_id)").fetchall():
+    for r in conn.execute("SELECT id, team_id, attempt_no FROM submissions s WHERE status='RESUBMISSION_ALLOWED' "
+                          "AND attempt_no=(SELECT MAX(attempt_no) FROM submissions x WHERE x.team_id=s.team_id AND x.ps_id IS s.ps_id)").fetchall():
         _transition(conn, r["id"], "DEADLINE_MISSED", None, "deadline sweep")
         notify.notify_team(conn, policy, r["team_id"], "deadline_missed", "Submission window closed",
                            [f"The deadline ({deadline(policy).strftime('%d %b %Y, %I:%M %p %Z')}) has passed and your team did not complete a successful submission.",
