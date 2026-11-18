@@ -28,11 +28,14 @@ def entry_rows(conn, admin) -> list[dict]:
         "SELECT d.submission_id, d.outcome, (SELECT 1 FROM evaluation_releases x WHERE x.decision_id=d.id) AS released FROM evaluation_decisions d "
         "WHERE d.id=(SELECT MAX(id) FROM evaluation_decisions y WHERE y.submission_id=d.submission_id)")}
     out = []
+    # one query: every team entry with its latest submission (no per-row lookups, fast with hundreds of teams)
     for e in conn.execute("SELECT e.team_id, e.entry_no, e.ps_id, e.locked_at, t.team_code, t.name AS team_name, p.title AS ps_title, "
-                          "p.domain_id AS track_id, d.name AS track FROM team_entries e JOIN teams t ON t.id=e.team_id "
-                          "JOIN problem_statements p ON p.id=e.ps_id JOIN domains d ON d.id=p.domain_id ORDER BY d.id, e.ps_id, t.team_code"):
-        s = conn.execute("SELECT id, status, attempt_no, submitted_at FROM submissions WHERE team_id=? AND ps_id=? ORDER BY attempt_no DESC LIMIT 1",
-                         (e["team_id"], e["ps_id"])).fetchone()
+                          "p.domain_id AS track_id, d.name AS track, s.id AS sid, s.status AS sstatus, s.attempt_no AS sattempt, "
+                          "s.submitted_at AS sat FROM team_entries e JOIN teams t ON t.id=e.team_id "
+                          "JOIN problem_statements p ON p.id=e.ps_id JOIN domains d ON d.id=p.domain_id "
+                          "LEFT JOIN submissions s ON s.id=(SELECT x.id FROM submissions x WHERE x.team_id=e.team_id AND x.ps_id=e.ps_id "
+                          "ORDER BY x.attempt_no DESC, x.id DESC LIMIT 1) ORDER BY d.id, e.ps_id, t.team_code"):
+        s = {"id": e["sid"], "status": e["sstatus"], "attempt_no": e["sattempt"], "submitted_at": e["sat"]} if e["sid"] else None
         sid = s["id"] if s else None
         sc = scores.get(sid, [])
         a = asg.get(sid, {})

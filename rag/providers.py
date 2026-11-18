@@ -6,6 +6,7 @@ Every provider speaks the OpenAI-compatible chat API. Keys are stored in the pri
 in full (only the last 4 characters)."""
 from __future__ import annotations
 
+import json
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -15,7 +16,8 @@ from rag.ollama import OllamaUnavailable
 
 # name -> (base URL, a suggested free/cheap model, where to get a key). Models change over time: edit them in the table.
 PRESETS = {
-    "Groq": ("https://api.groq.com/openai/v1", "llama-3.1-8b-instant", "https://console.groq.com/keys"),
+    "Groq (accurate, 70B)": ("https://api.groq.com/openai/v1", "llama-3.3-70b-versatile", "https://console.groq.com/keys"),
+    "Groq (fast, 8B)": ("https://api.groq.com/openai/v1", "llama-3.1-8b-instant", "https://console.groq.com/keys"),
     "Google Gemini": ("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-2.5-flash", "https://aistudio.google.com/apikey"),
     "OpenRouter": ("https://openrouter.ai/api/v1", "meta-llama/llama-3.3-70b-instruct:free", "https://openrouter.ai/keys"),
     "Hugging Face": ("https://router.huggingface.co/v1", "meta-llama/Llama-3.1-8B-Instruct", "https://huggingface.co/settings/tokens"),
@@ -26,6 +28,8 @@ PRESETS = {
 }
 COOLDOWN_RATE_LIMIT = 60      # seconds a provider rests after "too many requests"
 COOLDOWN_ERROR = 300          # seconds after any other failure
+TIMEOUT = (5, 25)             # (connect, read) seconds: a slow provider is skipped quickly to the next key
+MAX_TOKENS = 500              # short answers are faster and stay on topic
 
 
 def _now() -> datetime:
@@ -40,16 +44,40 @@ def mask(key: str) -> str:
     return ("•" * 8 + key[-4:]) if key and len(key) > 4 else "••••"
 
 
-def _call(base_url: str, api_key: str, model: str, system: str, user: str, timeout: float = 60, temperature: float = 0.1) -> str:
+def _body(model: str, system: str, user: str, temperature: float, stream: bool = False) -> dict:
+    return {"model": model, "temperature": temperature, "max_tokens": MAX_TOKENS, "stream": stream,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+
+
+def _call(base_url: str, api_key: str, model: str, system: str, user: str, timeout=TIMEOUT, temperature: float = 0.1) -> str:
     r = requests.post(base_url.rstrip("/") + "/chat/completions", timeout=timeout, headers={"Authorization": f"Bearer {api_key}"},
-                      json={"model": model, "temperature": temperature,
-                            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]})
+                      json=_body(model, system, user, temperature))
     if r.status_code >= 400:
         raise ProviderError(r.status_code, (r.text or "")[:200])
     try:
         return r.json()["choices"][0]["message"]["content"]
     except (KeyError, IndexError, ValueError) as exc:
         raise ProviderError(0, "unexpected answer format") from exc
+
+
+def _stream(base_url: str, api_key: str, model: str, system: str, user: str, timeout=TIMEOUT, temperature: float = 0.1):
+    """Yield pieces of the answer as the provider writes them (OpenAI-compatible server-sent events)."""
+    r = requests.post(base_url.rstrip("/") + "/chat/completions", timeout=timeout, stream=True,
+                      headers={"Authorization": f"Bearer {api_key}"}, json=_body(model, system, user, temperature, stream=True))
+    if r.status_code >= 400:
+        raise ProviderError(r.status_code, (r.text or "")[:200])
+    for line in r.iter_lines(decode_unicode=True):
+        if not line or not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            break
+        try:
+            piece = json.loads(data)["choices"][0].get("delta", {}).get("content") or ""
+        except (ValueError, KeyError, IndexError):
+            continue
+        if piece:
+            yield piece
 
 
 class ProviderError(Exception):
@@ -128,7 +156,7 @@ def test_provider(conn, admin, provider_id: int) -> tuple[bool, str]:
     r = conn.execute("SELECT * FROM ai_providers WHERE id=?", (provider_id,)).fetchone()
     t0 = time.perf_counter()
     try:
-        out = _call(r["base_url"], r["api_key"], r["model"], "You are a test.", "Reply with the single word OK.", timeout=30)
+        out = _call(r["base_url"], r["api_key"], r["model"], "You are a test.", "Reply with the single word OK.")
         conn.execute("UPDATE ai_providers SET last_ok_at=?, last_error=NULL, cooldown_until=NULL WHERE id=?", (_iso(_now()), provider_id))
         return True, f"Works ({(time.perf_counter() - t0) * 1000:.0f} ms): {out.strip()[:40]}"
     except (ProviderError, requests.RequestException) as exc:
@@ -184,6 +212,30 @@ class MultiApiChatClient:
             except (ProviderError, requests.RequestException) as exc:
                 wait = COOLDOWN_RATE_LIMIT if getattr(exc, "status", 0) == 429 else COOLDOWN_ERROR
                 self._record(p, ok=False, error=str(exc), cooldown=now + timedelta(seconds=wait))
+                errors.append(f"{p['name']}: {str(exc)[:80]}")
+        raise OllamaUnavailable("All AI keys are busy or failing (" + "; ".join(errors) + "). Try again in a minute, or add another key.")
+
+    def chat_stream(self, system: str, user: str):
+        """Stream from the first provider that answers; fall back to the next one if a provider fails before its first words."""
+        errors = []
+        now = _now()
+        for p in self._providers():
+            if p.get("cooldown_until") and datetime.fromisoformat(p["cooldown_until"]) > now:
+                errors.append(f"{p['name']}: resting")
+                continue
+            started = False
+            try:
+                for piece in _stream(p["base_url"], p["api_key"], p["model"], system, user):
+                    started = True
+                    yield piece
+                self._record(p, ok=True)
+                self.last_used = p["name"]
+                return
+            except (ProviderError, requests.RequestException) as exc:
+                wait = COOLDOWN_RATE_LIMIT if getattr(exc, "status", 0) == 429 else COOLDOWN_ERROR
+                self._record(p, ok=False, error=str(exc), cooldown=now + timedelta(seconds=wait))
+                if started:   # words were already shown: don't mix two providers' answers
+                    raise OllamaUnavailable(f"{p['name']} stopped mid-answer; please ask again.") from exc
                 errors.append(f"{p['name']}: {str(exc)[:80]}")
         raise OllamaUnavailable("All AI keys are busy or failing (" + "; ".join(errors) + "). Try again in a minute, or add another key.")
 

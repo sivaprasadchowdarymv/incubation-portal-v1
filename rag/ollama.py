@@ -75,7 +75,7 @@ class ApiChatClient:
     """Cloud AI through any OpenAI-compatible API (Groq free tier, Hugging Face router, OpenRouter...).
     Chat only: the knowledge base then uses keyword (BM25) search, which needs no embeddings."""
 
-    def __init__(self, base_url: str, api_key: str, model: str, timeout: float = 60, temperature: float = 0.1):
+    def __init__(self, base_url: str, api_key: str, model: str, timeout=(5, 25), temperature: float = 0.1):
         self.base_url, self.api_key, self.chat_model, self.timeout, self.temperature = base_url.rstrip("/"), api_key, model, timeout, temperature
         self.embed_model = None
 
@@ -86,11 +86,18 @@ class ApiChatClient:
     def embed(self, texts: list[str]) -> np.ndarray:
         raise OllamaUnavailable("Cloud mode uses keyword search (no embeddings).")
 
+    def chat_stream(self, system: str, user: str):
+        from rag.providers import _stream
+        try:
+            yield from _stream(self.base_url, self.api_key, self.chat_model, system, user, temperature=self.temperature)
+        except requests.RequestException as exc:
+            raise OllamaUnavailable(f"AI service not reachable ({type(exc).__name__}). Check LLM_API_KEY / LLM_MODEL.") from exc
+
     def chat(self, system: str, user: str) -> str:
         try:
             r = requests.post(self.base_url + "/chat/completions", timeout=self.timeout,
                               headers={"Authorization": f"Bearer {self.api_key}"},
-                              json={"model": self.chat_model, "temperature": self.temperature,
+                              json={"model": self.chat_model, "temperature": self.temperature, "max_tokens": 500,
                                     "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]})
             r.raise_for_status()
             return r.json()["choices"][0]["message"]["content"]

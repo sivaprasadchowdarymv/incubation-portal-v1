@@ -20,7 +20,7 @@ Result: a web address like `https://incubation-portal.streamlit.app`. Everyone o
 2. Open your repository on GitHub → **Add file → Upload files**.
 3. Open the unzipped `incubation_portal_streamlit` folder, select **everything inside it**, drag it into the page.
    GitHub replaces files with the same name. Wait until every file is listed → **Commit changes**.
-4. Streamlit redeploys by itself (1–3 minutes). On the first start the database upgrades itself (schema v6); every team keeps its locked problem statement.
+4. Streamlit redeploys by itself (1–3 minutes). On the first start the database upgrades itself (schema v8); every team keeps its locked problem statement.
 5. Sign in as admin → 📊 Dashboard → you should see the new filters and tabs.
 6. Optional now: ⚙️ Programme Setup → **AI keys** (paste one or more keys) and → **Emails & reminders** → *Incubation inbox*.
 7. The old `LLM_API_KEY` secret still works (used after the keys you paste). You can delete it.
@@ -69,7 +69,7 @@ Nothing else changes: same address, same Secrets, same users and data.
    - **Emails & reminders:** programme name, portal address, **Incubation inbox** for queries (optional).
    - **Peer review rubric**, then **AI keys:** choose a provider → paste the key → **Add key** → **🧪 Test**. Add a second key from another provider for backup.
 5. 📚 Knowledge Base → **Rebuild index** (used for AI-drafted query replies).
-6. 🔑 Users → create reviewers (role reviewer + email).
+6. 🔑 Users → **📥 Import reviewers from Excel / Google Form** (see WHATS_NEW.md) — or create them one by one (role reviewer + email).
 7. 📜 Policy → **Back up now**.
 
 ### Part F — Trial run (20 min, incognito windows)

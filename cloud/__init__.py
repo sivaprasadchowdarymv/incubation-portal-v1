@@ -96,8 +96,10 @@ def ready(conn, settings, policy, client) -> None:
             bootstrap_admin(conn, os.environ.get("INCUB_ADMIN_USER", "admin"), pw)
             _log("first admin account created")
     if HybridIndex.needs_rebuild(settings.kb_dir, settings.index_dir):
+        # never wait for model downloads here: build a keyword index now; the background warm-up upgrades it to meaning-based search
         emb = client if client.status().get("embed_ok") else None
         HybridIndex.build(settings.kb_dir, settings.index_dir, emb, policy["rag"]["chunk_words"], policy["rag"]["chunk_overlap"])
+        _log("search index built")
 
 
 def _loop(sync_every: int, notify_every: int) -> None:

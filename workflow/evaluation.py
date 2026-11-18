@@ -113,8 +113,9 @@ def _latest_decision(conn, sid: int):
 
 def profile(conn, uid: int) -> dict:
     r = conn.execute("SELECT * FROM reviewer_profiles WHERE user_id=?", (uid,)).fetchone()
-    return {"expertise": json.loads(r["expertise"]), "max_load": r["max_load"], "available": bool(r["available"])} if r \
-        else {"expertise": [], "max_load": 8, "available": True}
+    return {"expertise": json.loads(r["expertise"]), "max_load": r["max_load"], "available": bool(r["available"]),
+            "topics": r["topics"], "organisation": r["organisation"], "designation": r["designation"]} if r \
+        else {"expertise": [], "max_load": 8, "available": True, "topics": "", "organisation": "", "designation": ""}
 
 
 def load(conn, uid: int) -> int:
@@ -148,16 +149,18 @@ def weighted_total(policy: dict, scores: dict) -> float:
 def reviewer_pool(conn, admin: User) -> list[dict]:
     authorize(conn, admin, "admin", action="reviewer_pool")
     out = []
-    for r in conn.execute("SELECT id, username, email, active FROM users WHERE role='reviewer' ORDER BY username"):
+    for r in conn.execute("SELECT id, username, email, active, full_name FROM users WHERE role='reviewer' ORDER BY username"):
         p = profile(conn, r["id"])
         done = conn.execute("SELECT COUNT(*) FROM review_assignments WHERE reviewer_id=? AND status='submitted'", (r["id"],)).fetchone()[0]
-        out.append({"id": r["id"], "username": r["username"], "email": r["email"] or "", "active": bool(r["active"]),
+        out.append({"id": r["id"], "username": r["username"], "full_name": r["full_name"] or "", "topics": p["topics"],
+                    "organisation": p["organisation"], "email": r["email"] or "", "active": bool(r["active"]),
                     "available": p["available"], "expertise": p["expertise"], "max_load": p["max_load"],
                     "load": load(conn, r["id"]), "reviews_done": done})
     return out
 
 
-def set_profile(conn, admin: User, reviewer_id: int, expertise: list[str], max_load: int, available: bool) -> None:
+def set_profile(conn, admin: User, reviewer_id: int, expertise: list[str], max_load: int, available: bool, *,
+                topics: str | None = None, organisation: str | None = None, designation: str | None = None) -> None:
     authorize(conn, admin, "admin", action="reviewer_profile")
     _is_staff_reviewer(conn, reviewer_id)
     valid = {r[0] for r in conn.execute("SELECT id FROM domains")}
@@ -168,6 +171,9 @@ def set_profile(conn, admin: User, reviewer_id: int, expertise: list[str], max_l
                  "ON CONFLICT(user_id) DO UPDATE SET expertise=excluded.expertise, max_load=excluded.max_load, "
                  "available=excluded.available, updated_at=excluded.updated_at",
                  (reviewer_id, json.dumps(exp), int(max_load), int(bool(available)), iso(now_utc())))
+    for col, val in (("topics", topics), ("organisation", organisation), ("designation", designation)):
+        if val is not None:
+            conn.execute(f"UPDATE reviewer_profiles SET {col}=? WHERE user_id=?", (str(val).strip()[:500], reviewer_id))
     audit(conn, admin, "reviewer_profile_updated", "user", reviewer_id, {"expertise": exp, "max_load": int(max_load), "available": bool(available)})
 
 

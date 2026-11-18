@@ -154,7 +154,7 @@ def counts(conn) -> dict:
     return {r["status"]: r["n"] for r in conn.execute("SELECT status, COUNT(*) AS n FROM queries GROUP BY status")}
 
 
-def ai_draft(conn, admin: User, query_id: int, idx, client, rag_cfg: dict) -> str:
+def ai_draft(conn, admin: User, query_id: int, idx, client, rag_cfg: dict, embedder=None, reranker=None) -> str:
     """A suggested reply grounded in the approved knowledge base. The admin always edits/approves before sending."""
     authorize(conn, admin, "admin", action="query_ai_draft")
     from rag.answer import answer
@@ -162,7 +162,7 @@ def ai_draft(conn, admin: User, query_id: int, idx, client, rag_cfg: dict) -> st
     if not msgs:
         raise WorkflowError("Nothing to answer.")
     q = conn.execute("SELECT subject FROM queries WHERE id=?", (query_id,)).fetchone()
-    res = answer(f"{q['subject']}. {msgs[-1]['body']}", idx, "student", client, rag_cfg, conn)
+    res = answer(f"{q['subject']}. {msgs[-1]['body']}", idx, "student", client, rag_cfg, conn, embedder=embedder, reranker=reranker)
     text = res["answer"].strip()
     if res["sources"]:
         text += "\n\nReference: " + "; ".join(s["label"] for s in res["sources"][:3])

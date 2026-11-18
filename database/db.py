@@ -316,7 +316,39 @@ CREATE TABLE ai_providers (
 );
 """
 
-MIGRATIONS: list[tuple[int, str]] = [(1, SCHEMA_V1), (2, SCHEMA_V2), (3, SCHEMA_V3), (4, SCHEMA_V4), (5, SCHEMA_V5), (6, SCHEMA_V6)]
+SCHEMA_V7 = """
+CREATE INDEX IF NOT EXISTS ix_sub_team_ps ON submissions(team_id, ps_id, attempt_no);
+CREATE INDEX IF NOT EXISTS ix_audit_actor_action ON audit_events(actor_id, action, at);
+CREATE INDEX IF NOT EXISTS ix_notif_event ON notifications(event_type);
+CREATE INDEX IF NOT EXISTS ix_assign_sub ON review_assignments(submission_id, status);
+CREATE INDEX IF NOT EXISTS ix_peer_sub ON peer_reviews(submission_id, status);
+CREATE INDEX IF NOT EXISTS ix_qmsg_query ON query_messages(query_id);
+CREATE INDEX IF NOT EXISTS ix_evaldec_sub ON evaluation_decisions(submission_id);
+CREATE INDEX IF NOT EXISTS ix_metrics_name_id ON metrics(name, id);
+"""
+
+SCHEMA_V8 = """
+CREATE TABLE assignment_proposals (
+  id INTEGER PRIMARY KEY,
+  submission_id INTEGER NOT NULL REFERENCES submissions(id),
+  reviewer_id INTEGER NOT NULL REFERENCES users(id),
+  score REAL NOT NULL,
+  reason TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending','approved','rejected','superseded')),
+  created_at TEXT NOT NULL,
+  decided_at TEXT,
+  decided_by INTEGER REFERENCES users(id)
+);
+CREATE INDEX ix_proposals ON assignment_proposals(status, submission_id);
+ALTER TABLE reviewer_profiles ADD COLUMN topics TEXT NOT NULL DEFAULT '';
+ALTER TABLE reviewer_profiles ADD COLUMN organisation TEXT NOT NULL DEFAULT '';
+ALTER TABLE reviewer_profiles ADD COLUMN designation TEXT NOT NULL DEFAULT '';
+ALTER TABLE users ADD COLUMN full_name TEXT;
+ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0;
+"""
+
+MIGRATIONS: list[tuple[int, str]] = [(1, SCHEMA_V1), (2, SCHEMA_V2), (3, SCHEMA_V3), (4, SCHEMA_V4), (5, SCHEMA_V5), (6, SCHEMA_V6), (7, SCHEMA_V7),
+                                     (8, SCHEMA_V8)]
 
 
 def connect(path: str | Path) -> sqlite3.Connection:

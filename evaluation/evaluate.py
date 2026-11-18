@@ -11,40 +11,123 @@ from rag.answer import answer
 from validation import checks, extract
 
 
-def rag_eval(index, dataset_path: Path, client=None, k: int = 5, cfg: dict | None = None, conn=None) -> dict:
-    items = json.loads(Path(dataset_path).read_text())["items"]
-    cfg = dict(cfg or {}, top_k=k)
-    p_at_k, r_at_k, lat, correct_abstain, false_abstain, answerable_n, unans_n = [], [], [], 0, 0, 0, 0
+EVAL_CSV_COLUMNS = ["question", "role", "expected_sources", "expected_facts", "answerable"]
+
+
+def load_items(path_or_items) -> list[dict]:
+    """A JSON file ({"items": [...]}), a CSV file/bytes (columns EVAL_CSV_COLUMNS; lists separated by ';'), or a ready list."""
+    if isinstance(path_or_items, list):
+        return path_or_items
+    if isinstance(path_or_items, (bytes, bytearray)):
+        raw, name = path_or_items.decode("utf-8-sig"), "upload.csv"
+    else:
+        raw, name = Path(path_or_items).read_text(encoding="utf-8-sig"), str(path_or_items)
+    if name.endswith(".json") or raw.lstrip().startswith("{"):
+        return json.loads(raw)["items"]
+    import csv
+    import io
+    items = []
+    for i, r in enumerate(csv.DictReader(io.StringIO(raw)), 2):
+        r = {k.strip().lower(): (v or "").strip() for k, v in r.items() if k}
+        if not r.get("question"):
+            continue
+        split = lambda v: [x.strip() for x in v.split(";") if x.strip()]
+        ans = r.get("answerable", "yes").lower() not in ("no", "false", "0", "n")
+        srcs = split(r.get("expected_sources", ""))
+        if ans and not srcs:
+            raise ValueError(f"Row {i}: an answerable question needs expected_sources (document file names separated by ';')")
+        items.append({"q": r["question"], "role": r.get("role") or "student", "expected_sources": srcs,
+                      "expected_facts": split(r.get("expected_facts", "")), "answerable": ans})
+    if not items:
+        raise ValueError("No questions found. Columns: " + ", ".join(EVAL_CSV_COLUMNS))
+    return items
+
+
+def _fact_found(fact: str, context: str) -> bool:
+    """A fact is present if its exact words, or all its meaningful (stemmed) words, appear in the retrieved context."""
+    from rag.index import tok
+    if " ".join(fact.lower().split()) in " ".join(context.lower().split()):
+        return True
+    need, have = set(tok(fact)), set(tok(context))
+    return bool(need) and need <= have
+
+
+def rag_eval(index, dataset, client=None, k: int = 5, cfg: dict | None = None, conn=None, *, embedder=None, reranker=None,
+             judge_answers: bool = False) -> dict:
+    """Retrieval quality on a labeled question set.
+
+    Hit@K   — share of answerable questions with a correct document in the top K (K = 1, 3, 5)
+    MRR     — mean of 1 / rank of the first correct document (0 when none in the top K)
+    Recall@K — share of all expected documents found in the top K (useful when a question has several sources)
+    Context recall — share of expected facts present in the passages actually given to the AI (top context_k)
+    Faithfulness — share of answer sentences supported by their cited passage (only with judge_answers=True and an AI client)
+    Abstention — share of unanswerable questions correctly answered "not in the knowledge base"."""
+    items = load_items(dataset)
+    cfg = dict(cfg or {}, top_k=max(k, 5))
+    ctx_k = int(cfg.get("context_k", 3))
+    hits_at = {1: [], 3: [], 5: []}
+    rr, rec, p_at_k, ctx_rec, faith, lat = [], [], [], [], [], []
+    correct_abstain = false_abstain = answerable_n = unans_n = 0
     rows = []
     for it in items:
-        res = answer(it["q"], index, it["role"], client, cfg)
+        gen = client if (judge_answers and it["answerable"]) else None
+        res = answer(it["q"], index, it["role"], gen, cfg, embedder=embedder, reranker=reranker, use_cache=False)
         lat.append(res["retrieval_ms"])
         srcs = [h["source"] for h in res["hits"]]
-        exp = set(it["expected_sources"])
-        abstained = res["status"] == "abstained"
+        exp = set(it.get("expected_sources") or [])
+        row = {"question": it["q"], "role": it["role"], "answerable": it["answerable"], "top_sources": srcs[:5], "mode": res["mode"]}
         if it["answerable"]:
             answerable_n += 1
-            p_at_k.append(sum(s in exp for s in srcs) / max(len(srcs), 1) if srcs else 0.0)
-            r_at_k.append(len(exp & set(srcs)) / len(exp))
-            false_abstain += abstained
+            rank = next((i + 1 for i, s in enumerate(srcs[:k]) if s in exp), None)
+            for kk in hits_at:
+                hits_at[kk].append(1.0 if rank and rank <= kk else 0.0)
+            rr.append(1 / rank if rank else 0.0)
+            rec.append(len(exp & set(srcs[:k])) / len(exp) if exp else 0.0)
+            p_at_k.append(sum(s in exp for s in srcs[:k]) / max(len(srcs[:k]), 1) if srcs else 0.0)
+            facts = it.get("expected_facts") or []
+            ctx = " ".join(h["text"] for h in res["hits"][:ctx_k])
+            found = [f for f in facts if _fact_found(f, ctx)]
+            if facts:
+                ctx_rec.append(len(found) / len(facts))
+            false_abstain += not res["hits"]
+            if gen is not None and res.get("faithfulness") is not None:
+                faith.append(res["faithfulness"])
+            row |= {"first_correct_rank": rank, "facts_found": f"{len(found)}/{len(facts)}" if facts else "-",
+                    "missing_facts": "; ".join(f for f in facts if f not in found), "faithfulness": res.get("faithfulness")}
         else:
             unans_n += 1
-            correct_abstain += abstained
-        rows.append({"q": it["q"], "status": res["status"], "top_sources": srcs, "mode": res["mode"]})
+            ok = not res["hits"] or res["status"] == "abstained"
+            correct_abstain += ok
+            row |= {"first_correct_rank": None, "facts_found": "-", "missing_facts": "", "abstained_correctly": ok}
+        rows.append(row)
+    m = lambda xs: round(statistics.mean(xs), 3) if xs else None
     out = {
-        "k": k, "n": len(items), "retrieval_mode": rows[0]["mode"] if rows else None,
-        "precision_at_k": round(statistics.mean(p_at_k), 3) if p_at_k else None,
-        "recall_at_k": round(statistics.mean(r_at_k), 3) if r_at_k else None,
+        "k": k, "n": len(items), "answerable": answerable_n, "retrieval_mode": rows[0]["mode"] if rows else None,
+        "hit_at_1": m(hits_at[1]), "hit_at_3": m(hits_at[3]), "hit_at_5": m(hits_at[5]), "mrr": m(rr),
+        "recall_at_k": m(rec), "precision_at_k": m(p_at_k), "context_recall": m(ctx_rec),
+        "faithfulness": m(faith) if faith else None,
         "unanswerable_abstention_rate": round(correct_abstain / unans_n, 3) if unans_n else None,
         "answerable_false_abstention_rate": round(false_abstain / answerable_n, 3) if answerable_n else None,
-        "retrieval_latency_ms_mean": round(statistics.mean(lat), 2) if lat else None,
-        "rows": rows,
+        "retrieval_latency_ms_mean": m(lat), "rows": rows,
     }
     if conn is not None:
-        for key in ("precision_at_k", "recall_at_k", "unanswerable_abstention_rate", "retrieval_latency_ms_mean"):
+        for key in ("hit_at_1", "hit_at_3", "hit_at_5", "mrr", "recall_at_k", "precision_at_k", "context_recall", "faithfulness",
+                    "unanswerable_abstention_rate", "retrieval_latency_ms_mean"):
             if out[key] is not None:
-                metrics.record(conn, f"eval_{key}", out[key], {"k": k, "mode": out["retrieval_mode"]})
+                metrics.record(conn, f"eval_{key}", out[key], {"k": k, "mode": out["retrieval_mode"], "n": out["n"]})
     return out
+
+
+def eval_history(conn, limit: int = 30) -> list[dict]:
+    """One row per evaluation run (newest first), from the persisted metrics."""
+    names = ["hit_at_3", "mrr", "context_recall", "faithfulness", "hit_at_1", "recall_at_k"]
+    rows: dict[str, dict] = {}
+    for r in conn.execute(f"SELECT name, value, at, labels FROM metrics WHERE name IN ({','.join('?' * len(names))}) ORDER BY id DESC LIMIT ?",
+                          [f"eval_{n}" for n in names] + [limit * len(names)]):
+        d = rows.setdefault(r["at"], {"run": r["at"].replace("T", " ")[:16], "mode": json.loads(r["labels"]).get("mode"),
+                                      "questions": json.loads(r["labels"]).get("n")})
+        d[r["name"][5:]] = r["value"]
+    return list(rows.values())[:limit]
 
 
 def labeled_documents() -> list[dict]:

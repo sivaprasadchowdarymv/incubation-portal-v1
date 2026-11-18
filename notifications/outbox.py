@@ -10,6 +10,7 @@ from email.utils import formatdate, make_msgid
 import requests
 
 MAX_ATTEMPTS = 5
+SENSITIVE_EVENTS = {"reviewer_invite"}
 DISCARDED = "Discarded by admin (never sent)"
 
 
@@ -114,6 +115,8 @@ def deliver_pending(conn, settings, limit: int = 100) -> dict:
             try:
                 _brevo_send(settings, r["recipient"], r["subject"], r["body"])
                 conn.execute("UPDATE notifications SET status='sent', attempts=attempts+1, sent_at=?, last_error=NULL WHERE id=?", (_now(), r["id"]))
+                if r["event_type"] in SENSITIVE_EVENTS:  # never keep a temporary password in the database after it is sent
+                    conn.execute("UPDATE notifications SET body=? WHERE id=?", ("[content removed after sending: it contained sign-in details]", r["id"]))
                 sent += 1
             except _AuthProblem as exc:  # wrong key / unverified sender: record once for every remaining message and stop
                 for rr in rows[i:]:
@@ -137,6 +140,8 @@ def deliver_pending(conn, settings, limit: int = 100) -> dict:
             try:
                 server.send_message(_message(settings, r["recipient"], r["subject"], r["body"]))
                 conn.execute("UPDATE notifications SET status='sent', attempts=attempts+1, sent_at=?, last_error=NULL WHERE id=?", (_now(), r["id"]))
+                if r["event_type"] in SENSITIVE_EVENTS:  # never keep a temporary password in the database after it is sent
+                    conn.execute("UPDATE notifications SET body=? WHERE id=?", ("[content removed after sending: it contained sign-in details]", r["id"]))
                 sent += 1
             except Exception as exc:
                 conn.execute("UPDATE notifications SET status='failed', attempts=attempts+1, last_error=? WHERE id=?", (f"{type(exc).__name__}: {exc}"[:300], r["id"]))

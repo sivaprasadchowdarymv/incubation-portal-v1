@@ -17,8 +17,10 @@ if not a.force and not HybridIndex.needs_rebuild(s.kb_dir, s.index_dir):
     raise SystemExit(0)
 client = make_client(s)
 st = client.status()
-emb = client if st["embed_ok"] else None
+from rag.local_models import pick_embedder  # noqa: E402  (local model first, then Ollama)
+
+emb = pick_embedder(client)
 if emb is None:
-    print("WARNING: embedding model unavailable -> building BM25-only index. Fix:", "; ".join(st["instructions"]))
+    print("WARNING: no embedding model available -> building keyword-only index. Fix:", "; ".join(st["instructions"]))
 idx = HybridIndex.build(s.kb_dir, s.index_dir, emb, p["rag"]["chunk_words"], p["rag"]["chunk_overlap"])
 print(json.dumps(idx.meta, indent=2))

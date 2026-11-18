@@ -231,6 +231,21 @@ def hard_checks(text: str, extraction_error: str | None, policy: dict, ps: dict,
 
 # ---------------- similarity ----------------
 
+_SHINGLE_CACHE: dict = {}
+_SHINGLE_MAX = 4000
+
+
+def cached_shingles(text: str, n: int) -> set[tuple]:
+    """Fingerprints of a stored abstract are computed once and reused for every later comparison."""
+    key = (hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest(), n)
+    hit = _SHINGLE_CACHE.get(key)
+    if hit is None:
+        if len(_SHINGLE_CACHE) >= _SHINGLE_MAX:
+            _SHINGLE_CACHE.pop(next(iter(_SHINGLE_CACHE)))
+        hit = _SHINGLE_CACHE[key] = frozenset(shingles(text, n))
+    return hit
+
+
 def shingles(text: str, n: int) -> set[tuple]:
     t = tokens(text)
     if len(t) < n:
@@ -289,7 +304,7 @@ def similarity_assessment(text: str, team_id: int, corpus: list[dict], policy: d
     mine = shingles(text, n)
     best_id, best, best_shared = None, -1.0, set()
     for r in others:
-        s_other = shingles(r["extracted_text"], n)
+        s_other = cached_shingles(r["extracted_text"], n)
         sc = jaccard(mine, s_other)
         if sc > best:
             best_id, best, best_shared = r["id"], sc, mine & s_other

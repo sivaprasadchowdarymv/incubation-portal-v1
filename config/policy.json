@@ -61,7 +61,7 @@
     },
     "relevance": {
       "min_keyword_matches": 2,
-      "action": "review"
+      "action": "fail"
     },
     "min_words_per_section": 15,
     "ps_similarity": {
@@ -89,7 +89,24 @@
     "bm25_min_score": 0.5,
     "semantic_min_cosine": 0.35,
     "rrf_k": 60,
-    "min_query_coverage": 0.5
+    "min_query_coverage": 0.5,
+    "context_k": 3,
+    "rerank_pool": 20,
+    "synonyms": [
+      "group = team",
+      "teammate = member",
+      "last date = deadline, due date",
+      "tries = attempts, chances",
+      "file type = format",
+      "fee = cost, charge, payment",
+      "copy = duplicate, plagiarism",
+      "domain = track",
+      "topic = problem statement",
+      "marks = score",
+      "jury = reviewer, evaluator",
+      "result = outcome, decision",
+      "upload = submit, submission"
+    ]
   },
   "awaiting_admin_confirmation": [
     "submission.deadline",
@@ -293,5 +310,20 @@
       "waitlisted",
       "not_shortlisted"
     ]
+  },
+  "agents": {
+    "guardrail": {
+      "enabled": true,
+      "alert_admins": true
+    },
+    "content": {
+      "enabled": true,
+      "min_technical_percent": 75,
+      "action": "reject",
+      "use_ai": true
+    },
+    "assignment": {
+      "auto_propose": true
+    }
   }
 }

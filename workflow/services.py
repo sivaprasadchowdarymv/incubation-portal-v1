@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import agents
 from database.db import tx
 from evaluation import metrics
 from notifications import service as notify
@@ -161,6 +162,31 @@ def set_user_email(conn, admin: User, user_id: int, email: str | None, policy: d
                             "If you did not expect this, contact the incubation office."], f"emailset:{user_id}:{now_utc().strftime('%Y%m%d%H%M%S')}")
 
 
+def must_change_password(conn, user: User) -> bool:
+    r = conn.execute("SELECT must_change_password FROM users WHERE id=?", (user.id,)).fetchone()
+    return bool(r and r["must_change_password"])
+
+
+def change_password(conn, user: User, current: str, new: str, confirm: str | None = None) -> None:
+    """Any signed-in user changes their own password (required at first sign-in for imported reviewers)."""
+    r = conn.execute("SELECT pw_hash FROM users WHERE id=? AND active=1", (user.id,)).fetchone()
+    if not r or not verify_password(current or "", r["pw_hash"]):
+        raise WorkflowError("Your current password is not correct.")
+    if confirm is not None and new != confirm:
+        raise WorkflowError("The two new passwords do not match.")
+    if new == current:
+        raise WorkflowError("Choose a password different from the current one.")
+    try:
+        h = hash_password(new)
+    except ValueError as exc:
+        raise WorkflowError(str(exc)) from None
+    conn.execute("UPDATE users SET pw_hash=?, must_change_password=0 WHERE id=?", (h, user.id))
+    audit(conn, user, "password_changed", "user", user.id)
+    notify.notify_user(conn, None, user.id, "password_changed", "Your password was changed",
+                       ["Your portal password was changed just now.", "If this was not you, contact the incubation office immediately."],
+                       f"pwchg:{user.id}:{now_utc().strftime('%Y%m%d%H%M%S%f')}")
+
+
 def list_users(conn, admin: User, search: str = "", role: str = "") -> list[dict]:
     authorize(conn, admin, "admin", action="list_users")
     sql = ("SELECT u.id, u.username, u.role, u.email, u.active, u.created_at, t.team_code, "
@@ -215,6 +241,7 @@ def update_user(conn, policy: dict | None, admin: User, user_id: int, *, email: 
                 raise WorkflowError("This is the last active admin; create another admin first.")
         changes["active"] = int(bool(active))
     if new_password:
+        changes["must_change_password"] = 1          # the person chooses their own password at next sign-in
         try:
             changes["pw_hash"] = hash_password(new_password)
         except ValueError as exc:
@@ -227,6 +254,7 @@ def update_user(conn, policy: dict | None, admin: User, user_id: int, *, email: 
             conn.execute("UPDATE review_assignments SET status='withdrawn', note='reviewer deactivated', responded_at=? "
                          "WHERE reviewer_id=? AND status IN ('assigned','accepted')", (iso(now_utc()), user_id))
         audit(conn, admin, "user_updated", "user", user_id, {k: ("***" if k == "pw_hash" else v) for k, v in changes.items()})
+    changes.pop("must_change_password", None)
     said = {"email": "your email address was updated", "role": f"your role is now {changes.get('role')}",
             "active": "your account was " + ("re-activated" if changes.get("active") else "deactivated"),
             "pw_hash": "your password was reset by an administrator (you will receive the new password separately)"}
@@ -457,6 +485,17 @@ def add_problem_statement(conn, policy: dict, user: User, domain_id: str, ps_id:
     return eid
 
 
+def _auto_propose(conn, policy: dict, sid: int) -> None:
+    """Assignment agent: propose reviewers for a newly accepted abstract (the admin approves before anything is shared)."""
+    if not policy.get("agents", {}).get("assignment", {}).get("auto_propose", True):
+        return
+    try:
+        from agents import assigner
+        assigner.propose(conn, policy, sid)
+    except Exception as exc:  # never let the agent break an acceptance
+        log.warning("assignment agent failed for submission %s: %s", sid, exc)
+
+
 def _maybe_team_complete(conn, policy: dict, team_id: int) -> None:
     """Completion acknowledgement: every problem statement of the team now has an accepted abstract."""
     entries = team_entries(conn, team_id)
@@ -547,7 +586,7 @@ def _after_failure_state(conn, policy: dict, sub, now: datetime) -> tuple[str, s
 # ---------------- submissions ----------------
 
 def submit(conn, policy: dict, storage_dir: Path, user: User, file_name: str, data: bytes, now: datetime | None = None, embedder=None,
-           ps_id: str | None = None) -> dict:
+           ps_id: str | None = None, ai_client=None) -> dict:
     authorize(conn, user, "student", action="submit")
     user = refresh_user(conn, user)
     if not user.team_id:
@@ -616,14 +655,14 @@ def submit(conn, policy: dict, storage_dir: Path, user: User, file_name: str, da
                         f"Problem statement: {ps_id}",
                         "Automatic checks are running; you will receive the result shortly."], f"recv:{sid}")
     _transition(conn, sid, "VALIDATING", None, "validation started")
-    return _validate(conn, policy, user, team, sid, safe, data, now, t0, embedder, ps_id)
+    return _validate(conn, policy, user, team, sid, safe, data, now, t0, embedder, ps_id, ai_client)
 
 
 DRAFT_CHECKS_PER_DAY = 20
 
 
 def check_draft(conn, policy: dict, user: User, file_name: str, data: bytes, now: datetime | None = None, embedder=None,
-                ps_id: str | None = None) -> dict:
+                ps_id: str | None = None, ai_client=None) -> dict:
     """Run the same automatic checks on a draft WITHOUT creating a submission or using an attempt. Nothing is stored."""
     authorize(conn, user, "student", action="check_draft")
     user = refresh_user(conn, user)
@@ -653,15 +692,16 @@ def check_draft(conn, policy: dict, user: User, file_name: str, data: bytes, now
     ex = extract.extract(safe, data)
     results = checks.hard_checks(ex.text, ex.error, policy, ps, track, ps_list, embedder)
     if not ex.error and ex.text:
+        results += agents.screen(ex.text, data, safe, ps, track, policy, ai_client, agents.keywords_ok(results))
         corpus = [dict(r) for r in conn.execute("SELECT id, team_id, extracted_text, text_hash FROM submissions WHERE extracted_text IS NOT NULL AND extracted_text != ''")]
         results += checks.similarity_assessment(ex.text, team["id"], corpus, policy, embedder)[1]
     errors = [r for r in results if r.result == "fail" and r.severity == "error"]
-    verdict = "fix" if errors else "review" if any(r.review_flag for r in results) else "pass"
+    verdict = "review" if agents.guardrail_hit(results) else "fix" if errors else "review" if any(r.review_flag for r in results) else "pass"
     return {"verdict": verdict, "results": [r.to_dict() for r in results], "word_count": len(checks.tokens(ex.text or "")),
             "checks_left": DRAFT_CHECKS_PER_DAY - used - 1}
 
 
-def _validate(conn, policy, user, team, sid, safe, data, now, t0, embedder, ps_id=None) -> dict:
+def _validate(conn, policy, user, team, sid, safe, data, now, t0, embedder, ps_id=None, ai_client=None) -> dict:
     ps = dict(conn.execute("SELECT * FROM problem_statements WHERE id=?", (ps_id or team["ps_id"],)).fetchone())
     ps["keywords"] = json.loads(ps["keywords"])
     trow = conn.execute("SELECT * FROM domains WHERE id=?", (ps["domain_id"],)).fetchone()
@@ -675,6 +715,7 @@ def _validate(conn, policy, user, team, sid, safe, data, now, t0, embedder, ps_i
         corpus = [dict(r) for r in conn.execute("SELECT id, team_id, extracted_text, text_hash FROM submissions WHERE id != ? AND extracted_text IS NOT NULL AND extracted_text != ''", (sid,))]
         findings, sim_results = checks.similarity_assessment(ex.text, team["id"], corpus, policy, embedder)
         results += sim_results
+        results += agents.screen(ex.text, data, safe, ps, track, policy, ai_client, agents.keywords_ok(results))   # guardrail + content analyser
     ts = iso(now_utc())
     with tx(conn):
         conn.execute("UPDATE submissions SET extracted_text=?, text_hash=?, word_count=? WHERE id=?",
@@ -689,6 +730,14 @@ def _validate(conn, policy, user, team, sid, safe, data, now, t0, embedder, ps_i
     flags = [r.check_id for r in results if r.review_flag]
     sub = conn.execute("SELECT * FROM submissions WHERE id=?", (sid,)).fetchone()
     att, maxa = sub["attempt_no"], policy["submission"]["max_attempts"]
+    if agents.guardrail_hit(results):
+        # a manipulation attempt always goes to a person, even when format checks also failed
+        errors = []
+        g = next(r for r in results if r.check_id in agents.GUARDRAIL_IDS and r.review_flag)
+        if policy.get("agents", {}).get("guardrail", {}).get("alert_admins", True):
+            notify.notify_staff(conn, policy, ("admin",), "guardrail_alert", f"Possible manipulation attempt: {team['team_code']} attempt {att}",
+                                [f"Submission #{sid} from team {team['team_code']} ({ps['id']}) contains text aimed at the evaluation system.",
+                                 g.message, "", "It was NOT accepted automatically. Decide in the Review Queue."], f"guardalert:{sid}", force=True)
     if errors:
         _transition(conn, sid, "VALIDATION_FAILED", None, "; ".join(r.check_id for r in errors))
         nxt, why = _after_failure_state(conn, policy, sub, now)
@@ -722,6 +771,7 @@ def _validate(conn, policy, user, team, sid, safe, data, now, t0, embedder, ps_i
                             "No further action is needed for this problem statement."],
                            f"accept:{sid}")
         _maybe_team_complete(conn, policy, team["id"])
+        _auto_propose(conn, policy, sid)
     ms = (time.perf_counter() - t0) * 1000
     conn.execute("UPDATE submissions SET processing_ms=? WHERE id=?", (ms, sid))
     metrics.record(conn, "submission_processing_ms", ms, {"submission": sid})
@@ -882,6 +932,7 @@ def decide(conn, policy: dict, user: User, submission_id: int, outcome: str, rea
                        f"decision:{submission_id}")
     if final == "ACCEPTED_FOR_EVALUATION":
         _maybe_team_complete(conn, policy, team["id"])
+        _auto_propose(conn, policy, submission_id)
     notify.notify_user(conn, policy, user.id, "decision_ack", f"Decision recorded: {team['team_code']} submission #{submission_id}",
                        [f"Your decision '{outcome.replace('_', ' ')}' for submission #{submission_id} (team {team['team_code']}) was recorded.",
                         f"Reason: {reason}"] + ([f"Policy reference: {policy_ref}"] if policy_ref else []) + ["The team has been notified."],

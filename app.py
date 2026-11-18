@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import os
 
 import pandas as pd
@@ -12,13 +13,16 @@ from evaluation.metrics import workflow_summary
 from notifications.outbox import count_waiting, deliver_pending, describe, send_test_email, smtp_configured
 from notifications.service import outbox_counts, recent_failures, send_deadline_reminders, send_review_reminders
 from persist import snapshot as persist
-from rag import providers
+from config.settings import ROOT
+from rag import local_models, providers
 from rag.answer import answer
 from rag.index import HybridIndex
 from rag.ollama import make_client
 from security.auth import AuthError
 from workflow import evaluation as ev
+from agents import assigner
 from workflow import queries as qs
+from workflow import reviewer_import as ri
 from workflow import services as sv
 from workflow import setup, stats
 from workflow.context import open_app
@@ -31,6 +35,9 @@ st.markdown("""<style>
 .chip{display:inline-block;background:rgba(255,255,255,.18);border-radius:999px;padding:2px 12px;margin:6px 6px 0 0;font-size:.85rem}
 .step{border-radius:10px;padding:8px 10px;text-align:center;font-size:.85rem;border:1px solid rgba(128,128,128,.25)}
 .step.done{background:#e6f4ea;border-color:#34a853}.step.now{background:#fff4e5;border-color:#f9ab00}
+.done-card{border-left:5px solid #1c8a5a;background:rgba(28,138,90,.10);padding:10px 14px;border-radius:8px;margin:8px 0 12px}
+.done-title{font-weight:700;color:#1c8a5a;margin-bottom:2px}
+.done-next{margin-top:4px;font-size:.92em;opacity:.85}
 </style>""", unsafe_allow_html=True)
 
 
@@ -41,6 +48,8 @@ def app_ctx():
     cloud.ready(*ctx, make_client(ctx[1]))
     if cloud.enabled() or os.environ.get("RUN_WORKER_IN_APP") == "1":
         cloud.background()               # emails, reminders and data upload without a second window
+    import threading
+    threading.Thread(target=local_models.warm_and_upgrade, args=(ctx[1], ctx[2]), daemon=True, name="warm-models").start()
     return ctx
 
 
@@ -54,16 +63,45 @@ def model_status():
     return client.status()
 
 
+@st.cache_resource(max_entries=2, show_spinner=False)
+def _shared_index(index_dir: str, mtime: float):
+    """One loaded index shared by every user session (reloaded only when the index files change)."""
+    return HybridIndex.load(Path(index_dir))
+
+
 def load_index():
     if HybridIndex.needs_rebuild(settings.kb_dir, settings.index_dir):
         return None
-    key = (settings.index_dir / "meta.json").stat().st_mtime
-    if st.session_state.get("_idx_key") != key:
-        st.session_state["_idx"], st.session_state["_idx_key"] = HybridIndex.load(settings.index_dir), key
-    return st.session_state["_idx"]
+    return _shared_index(str(settings.index_dir), (settings.index_dir / "meta.json").stat().st_mtime)
 
 
-_LAST_OK: list[str] = []   # confirmation of the last successful action in this script run
+@st.cache_data(ttl=30, show_spinner=False)
+def _dashboard_rows(_conn, _user, db_key: str) -> list[dict]:
+    """Dashboard statistics, cached for 30 s (one query for all teams)."""
+    return stats.entry_rows(_conn, _user)
+
+
+def rag_tools() -> dict:
+    """Local meaning-based search + re-ranking models (None while loading or if unavailable)."""
+    return {"embedder": local_models.get_embedder() if local_models.status()["embed_loaded"] else None,
+            "reranker": local_models.get_reranker() if local_models.status()["rerank_loaded"] else None}
+
+
+_LAST_OK: list[tuple[str, str | None]] = []   # completed tasks in this script run: (what was done, next step)
+
+
+def completion_card(msg: str, then: str | None = None) -> None:
+    """The on-screen acknowledgement shown after every completed task."""
+    import html as _h
+    st.markdown(f"<div class='done-card' role='status'><div class='done-title'>✅ Task completed</div><div>{_h.escape(msg)}</div>"
+                + (f"<div class='done-next'>➡️ Next: {_h.escape(then)}</div>" if then else "") + "</div>", unsafe_allow_html=True)
+
+
+def done(msg: str, then: str | None = None) -> None:
+    """Acknowledge a completed task: a pop-up notice plus a panel that survives the page refresh."""
+    _LAST_OK.append((msg, then))
+    st.toast(msg, icon="✅")
+    completion_card(msg, then)
 
 
 def refresh():
@@ -73,13 +111,12 @@ def refresh():
     st.rerun()
 
 
-def run(fn, *a, ok: str | None = None, **kw):
+def run(fn, *a, ok: str | None = None, then: str | None = None, **kw):
     """Call a backend service and surface its real outcome."""
     try:
         res = fn(*a, **kw)
         if ok:
-            st.success(ok)
-            _LAST_OK.append(ok)
+            done(ok, then)
         persist.backup_soon()  # copy the change to persistent storage (no-op on PC installs)
         if smtp_configured(settings) and policy.get("notifications", {}).get("auto_send", True):
             try:  # send acknowledgements/alerts right away; failures stay queued for the worker to retry
@@ -141,6 +178,13 @@ with st.sidebar:
         if st.button("Sign out"):
             st.session_state.clear()
             refresh()
+        with st.expander("🔑 Change my password"):
+            with st.form("chpw", clear_on_submit=True):
+                o = st.text_input("Current password", type="password")
+                n1 = st.text_input("New password (min 8)", type="password")
+                n2 = st.text_input("New password again", type="password")
+                if st.form_submit_button("Change password"):
+                    run(sv.change_password, conn, user, o, n1, n2, ok="Password changed. A confirmation email was sent.")
     if user and user.role == "admin":  # AI status matters only to staff
         ms = model_status()
         st.caption((f"🟢 AI: {client.chat_model} (cloud)" if ms.get("provider") == "api" and ms["chat_ok"] else "🟢 Ollama (local AI)" if ms["reachable"]
@@ -167,8 +211,20 @@ if not user:
         sem = st.text_input("Your email (optional, for a confirmation)")
         scode = st.text_input("Sign-up code (from the incubation office)", type="password") if settings.signup_code else None
         if st.form_submit_button("Create student account") and run(sv.signup_student, conn, un, pw, sem, policy, scode, settings.signup_code,
-                                                                     ok="Account created. Sign in."):
+                                                                     ok="Your student account is created.", then="open the Sign in tab and sign in"):
             pass
+    st.stop()
+
+if sv.must_change_password(conn, user):
+    st.header("🔑 Choose your own password")
+    st.info("You signed in with a temporary password. Please choose your own password to continue.")
+    with st.form("firstpw"):
+        o = st.text_input("Temporary password", type="password")
+        n1 = st.text_input("New password (min 8 characters)", type="password")
+        n2 = st.text_input("New password again", type="password")
+        if st.form_submit_button("Save my password", type="primary") and run(sv.change_password, conn, user, o, n1, n2,
+                                                                            ok="Your password is set.", then="open your pages from the menu"):
+            refresh()
     st.stop()
 
 ICON = {"My Team": "👥", "Submit": "📤", "History": "🗂️", "Policy Assistant": "💬", "Review Queue": "🧑‍⚖️", "Submissions": "📄",
@@ -267,7 +323,8 @@ page = st.sidebar.radio("Navigate", PAGES[user.role],
                         format_func=lambda p: f"{ICON.get(p, '•')} {p}" + (f" ({_open_q} open)" if p == "Queries" and _open_q else ""))
 hero()
 if _flash := st.session_state.pop("_flash", None):
-    st.success(f"✅ {_flash}")
+    st.toast(_flash[0], icon="✅")
+    completion_card(*_flash)
 
 # ---------------- student pages ----------------
 if page == "My Team":
@@ -283,7 +340,8 @@ if page == "My Team":
                 c = st.columns(3)
                 members.append({"full_name": c[0].text_input(f"Member {i+1} name"), "member_ref": c[1].text_input(f"Member {i+1} ID / roll no."),
                                 "email": c[2].text_input(f"Member {i+1} email (optional)")})
-            if st.form_submit_button("Register and lock team") and run(sv.register_team, conn, policy, user, name, email, members, ok="Team registered and locked."):
+            if st.form_submit_button("Register and lock team") and run(sv.register_team, conn, policy, user, name, email, members, ok="Team registered and membership locked.",
+                    then="choose and lock your problem statement below"):
                 refresh()
     else:
         t = sv.get_team(conn, user, user.team_id)
@@ -309,7 +367,7 @@ if page == "My Team":
                     if ps:
                         ok = st.checkbox("I understand this addition cannot be removed later.", key="add_ok")
                         if st.button("Add this problem statement", disabled=not ok) and run(sv.add_problem_statement, conn, policy, user, d["id"], ps["id"],
-                                                                                            ok="Added. Choose it on the 📤 Submit page."):
+                                                                                            ok="Problem statement added to your team.", then="choose it on the 📤 Submit page and upload the abstract"):
                             refresh()
         else:
             if not cat:
@@ -320,7 +378,8 @@ if page == "My Team":
                 st.caption(f"You can add up to {sv.max_entries(policy) - 1} more problem statement(s) later, each with its own attempts.")
             d, ps = choose_ps(cat, set(), "first")
             ok = st.checkbox("I understand this selection cannot be changed later.")
-            if st.button("Confirm and lock", disabled=not (ok and ps)) and run(sv.select_problem_statement, conn, user, d["id"], ps["id"], policy=policy, ok="Selection locked."):
+            if st.button("Confirm and lock", disabled=not (ok and ps)) and run(sv.select_problem_statement, conn, user, d["id"], ps["id"], policy=policy, ok="Track and problem statement locked.",
+                    then="📤 Submit: download the template, run Check my draft, then submit"):
                 refresh()
 
 elif page == "Submit":
@@ -369,7 +428,8 @@ elif page == "Submit":
         dfile = st.file_uploader("Draft", type=[e.strip(".") for e in policy["submission"]["allowed_extensions"]], key=f"draft_up_{dgen}")
         if st.button("Check draft", disabled=not dfile):
             with st.spinner("Checking…"):
-                dr = run(sv.check_draft, conn, policy, user, dfile.name, dfile.getvalue(), embedder=client if model_status()["embed_ok"] else None, ps_id=ps_id)
+                dr = run(sv.check_draft, conn, policy, user, dfile.name, dfile.getvalue(), embedder=client if model_status()["embed_ok"] else None, ps_id=ps_id,
+                         ai_client=client if model_status()["chat_ok"] else None)
             if dr:
                 {"pass": st.success, "review": st.warning, "fix": st.error}[dr["verdict"]](
                     {"pass": "✅ This draft would pass all automatic checks. You can submit it below.",
@@ -385,8 +445,14 @@ elif page == "Submit":
     if st.button("Submit", disabled=not (f and confirm)):
         with st.spinner("Validating…"):
             ms = model_status()
-            rep = run(sv.submit, conn, policy, settings.storage_dir, user, f.name, f.getvalue(), embedder=client if ms["embed_ok"] else None, ps_id=ps_id)
+            rep = run(sv.submit, conn, policy, settings.storage_dir, user, f.name, f.getvalue(), embedder=client if ms["embed_ok"] else None, ps_id=ps_id,
+                       ai_client=client if ms["chat_ok"] else None)
         if rep:  # rerun so the attempt counters above reflect this submission
+            nxt = {"ACCEPTED_FOR_EVALUATION": "nothing more for this problem statement; reviewers will evaluate it",
+                   "PENDING_REVIEW": "a reviewer will look at it; you will get an email",
+                   "RESUBMISSION_ALLOWED": "fix the items in the report below and submit again"}.get(rep.get("status"), "check the result below and your email")
+            _LAST_OK.append((f"Submission recorded for {ps_id}: attempt {rep.get('attempt_no')} — "
+                             f"{STATUS_LABEL.get(rep.get('status'), rep.get('status'))}. A receipt was emailed.", nxt))
             st.session_state["last_report"] = rep
             st.session_state["uploader_gen"] = st.session_state.get("uploader_gen", 0) + 1
             refresh()
@@ -448,7 +514,8 @@ elif page == "Ask the Incubation Team":
         body = st.text_area("Your message", height=160, max_chars=5000,
                             help="Include your team code or abstract code (e.g. P-0007) if it is about a specific submission.")
         if st.form_submit_button("Send to the incubation team", type="primary") and run(qs.send_query, conn, policy, user, cat_q, subj, body,
-                                                                                        ok="Sent. A confirmation email is on its way."):
+                                                                                        ok="Your query was sent to the incubation team. A confirmation email is on its way.",
+                                                                                                then="the reply will arrive by email and appear below"):
             pass
     mine = qs.my_queries(conn, user)
     if mine:
@@ -462,7 +529,7 @@ elif page == "Ask the Incubation Team":
                 st.write(m["body"])
             if q["status"] != "closed":
                 fu = st.text_area("Add a message to this query", key=f"fu{q['id']}")
-                if st.button("Send", key=f"fub{q['id']}") and run(qs.follow_up, conn, policy, user, q["id"], fu, ok="Sent."):
+                if st.button("Send", key=f"fub{q['id']}") and run(qs.follow_up, conn, policy, user, q["id"], fu, ok="Your message was added to the query.", then="the incubation team will reply by email"):
                     refresh()
 
 # ---------------- reviewer / admin ----------------
@@ -473,7 +540,7 @@ elif page == "My Reviews":
         with st.container(border=True):
             st.markdown("#### 🔒 Reviewer confidentiality pledge")
             st.write(ev.PLEDGE)
-            if st.checkbox("I agree", key="pledge_ok") and st.button("Confirm pledge", type="primary") and run(ev.pledge, conn, user, ok="Thank you."):
+            if st.checkbox("I agree", key="pledge_ok") and st.button("Confirm pledge", type="primary") and run(ev.pledge, conn, user, ok="Confidentiality pledge recorded.", then="open an assigned abstract below"):
                 refresh()
         st.stop()
     rows = ev.my_assignments(conn, policy, user)
@@ -496,12 +563,12 @@ elif page == "My Reviews":
         if r["status"] == "assigned":
             st.warning("Step 1 — please accept this assignment, or decline it (e.g. conflict of interest: you know the team, same department, mentor…).")
             b = st.columns(2)
-            if b[0].button("✅ Accept assignment", key=f"acc{aid}") and run(ev.respond, conn, policy, user, aid, True, ok="Accepted. You can now download and review."):
+            if b[0].button("✅ Accept assignment", key=f"acc{aid}") and run(ev.respond, conn, policy, user, aid, True, ok="Assignment accepted.", then="download the abstract and score it"):
                 refresh()
             with b[1].popover("Decline / conflict of interest"):
                 why = st.text_area("Reason", key=f"why{aid}")
                 coi = st.checkbox("I have a conflict of interest with this team", key=f"coi{aid}")
-                if st.button("Decline", key=f"dec{aid}") and run(ev.respond, conn, policy, user, aid, False, why, coi, ok="Declined. The organisers were told."):
+                if st.button("Decline", key=f"dec{aid}") and run(ev.respond, conn, policy, user, aid, False, why, coi, ok="Assignment declined. The organisers were told."):
                     refresh()
         try:
             fname, fdata = ev.assignment_file(conn, policy, user, aid, settings.storage_dir) if r["status"] != "assigned" else (None, None)
@@ -532,7 +599,7 @@ elif page == "My Reviews":
             draft = b[0].form_submit_button("💾 Save draft", disabled=r["locked"] or cur["status"] == "submitted")
             final = b[1].form_submit_button("📨 Submit review" if cur["status"] != "submitted" else "📨 Submit revised review", type="primary", disabled=r["locked"])
             if (draft or final) and run(ev.save_review, conn, policy, user, aid, scores, rec, conf, ct, cc, final,
-                                        ok="Review submitted. Thank you!" if final else "Draft saved."):
+                                        ok="Review submitted. Thank you!" if final else "Draft saved.", then="open your next assigned abstract" if final else "finish and press Submit review before the due date"):
                 refresh()
         others = ev.peer_reviews_visible_to(conn, policy, user, aid)
         if len(others) > 1:
@@ -542,7 +609,7 @@ elif page == "My Reviews":
         why2 = st.text_input("Reason", key=f"coi2{aid}")
         if st.button("Declare conflict and withdraw from this abstract", key=f"coib{aid}"):
             tid = conn.execute("SELECT team_id FROM submissions WHERE id=?", (r["submission_id"],)).fetchone()[0]
-            if run(ev.declare_conflict, conn, user, user.id, tid, why2, ok="Conflict recorded; the assignment was withdrawn."):
+            if run(ev.declare_conflict, conn, user, user.id, tid, why2, ok="Conflict of interest recorded; you were withdrawn from this abstract."):
                 refresh()
 
 elif page == "Peer Review":
@@ -559,7 +626,45 @@ elif page == "Peer Review":
     c[2].metric("Reviews done", sum(x["reviews_done"] for x in subs))
     c[3].metric("Decided", sum(bool(x["decision"]) for x in subs))
     c[4].metric("Released", sum(x["released"] for x in subs))
-    t1, t2, t3, t4, t5 = st.tabs(["1 · Reviewers", "2 · Assign", "3 · Progress", "4 · Decisions", "5 · Results & release"])
+    t0, t1, t2, t3, t4, t5 = st.tabs(["🤖 Agent proposals", "1 · Reviewers", "2 · Assign", "3 · Progress", "4 · Decisions", "5 · Results & release"])
+    with t0:
+        st.markdown("When an abstract is accepted, the **assignment agent** proposes reviewers (track experts and matching topics first, "
+                    "fair workload, conflicts excluded). **Nothing is shared until you approve.** Change any reviewer in the table, tick the rows, then approve.")
+        props = assigner.pending(conn, user)
+        cpa = st.columns(2)
+        if cpa[0].button("🤖 Propose reviewers for every abstract that still needs them"):
+            res = run(assigner.propose_all, conn, policy, user)
+            if res:
+                _LAST_OK.append((f"The agent made {res['proposed']} proposal(s)." + (f" Not enough free reviewers for: {', '.join(res['short'])}." if res["short"] else ""),
+                                 "check and approve them below"))
+                refresh()
+        if not props:
+            st.info("No proposals waiting. They appear here automatically when abstracts are accepted.")
+        else:
+            active = [p for p in pool if p["active"]]
+            names = {p["id"]: f"{p['username']} ({p['load']}/{p['max_load']})" for p in active}
+            label_to_id = {v: k for k, v in names.items()}
+            df = pd.DataFrame([{"Approve": True, "Reject": False, "Abstract": p["paper"], "Team": p["team_code"], "Track": p["track"],
+                                "PS": p["ps_id"], "Reviewer": names.get(p["reviewer_id"], p["username"]), "Why": p["reason"], "Score": p["score"],
+                                "_id": p["id"]} for p in props])
+            ed = st.data_editor(df, hide_index=True, width="stretch", key="props_ed", disabled=["Abstract", "Team", "Track", "PS", "Why", "Score"],
+                                column_config={"Reviewer": st.column_config.SelectboxColumn("Reviewer (change if needed)", options=list(label_to_id)),
+                                               "_id": None})
+            due = st.date_input("Review due date for approved assignments", sv.now_utc().date() + pd.Timedelta(days=ec["review_days"]), key="props_due")
+            b = st.columns(2)
+            if b[0].button(f"✅ Approve ticked ({int(ed['Approve'].sum())}) — share abstracts and email reviewers", type="primary"):
+                dec = [{"id": int(r["_id"]), "reviewer_id": label_to_id.get(r["Reviewer"])} for _, r in ed.iterrows() if r["Approve"] and not r["Reject"]]
+                res = run(assigner.approve, conn, policy, user, dec, due)
+                if res:
+                    _LAST_OK.append((f"{res['approved']} assignment(s) approved; reviewers were emailed and can open their abstracts."
+                                     + (" Problems: " + "; ".join(res["errors"]) if res["errors"] else ""), "follow progress in 3 · Progress"))
+                    refresh()
+            if b[1].button(f"✖ Reject ticked ({int(ed['Reject'].sum())}) and propose the next best"):
+                ids = [int(r["_id"]) for _, r in ed.iterrows() if r["Reject"]]
+                res = run(assigner.reject, conn, policy, user, ids)
+                if res:
+                    _LAST_OK.append((f"{res['rejected']} proposal(s) rejected; {res['new_proposals']} new proposal(s) made.", None))
+                    refresh()
     tracks = {d["id"]: d["name"] for d in sv.catalog(conn)}
     with t1:
         if not pool:
@@ -571,10 +676,11 @@ elif page == "Peer Review":
                 rid = st.selectbox("Reviewer", [p["id"] for p in pool], format_func=lambda i: next(p["username"] for p in pool if p["id"] == i))
                 cur = next(p for p in pool if p["id"] == rid)
                 exp = st.multiselect("Expertise (tracks)", list(tracks), default=cur["expertise"], format_func=lambda t: tracks.get(t, t))
+                tp = st.text_input("Topics / keywords of expertise (used by the assignment agent)", cur.get("topics", ""))
                 cc = st.columns(2)
                 ml = cc[0].number_input("Max load", 0, 100, cur["max_load"])
                 av = cc[1].toggle("Available for new assignments", cur["available"])
-                if st.form_submit_button("Save profile") and run(ev.set_profile, conn, user, rid, exp, int(ml), av, ok="Saved."):
+                if st.form_submit_button("Save profile") and run(ev.set_profile, conn, user, rid, exp, int(ml), av, topics=tp, ok="Reviewer profile saved."):
                     refresh()
             st.markdown("**Conflicts of interest** (a conflicted reviewer is never assigned to that team; the same email as a team member is detected automatically)")
             teams = [dict(x) for x in conn.execute("SELECT id, team_code, name FROM teams ORDER BY team_code")]
@@ -598,7 +704,7 @@ elif page == "Peer Review":
             if st.button(f"⚡ Auto-assign every abstract up to {ec['reviewers_per_submission']} reviewers", type="primary"):
                 res = run(ev.auto_assign, conn, policy, user)
                 if res:
-                    st.success(f"{res['assigned']} assignment(s) made; reviewers were emailed.")
+                    done(f"{res['assigned']} reviewer assignment(s) made; reviewers were emailed.", "track progress in 3 · Progress")
                     if res["short"]:
                         st.warning(f"Not enough free reviewers for: {', '.join(res['short'])}. Add reviewers or raise max load.")
             st.markdown("#### 🎯 Assign by track → problem statement")
@@ -634,7 +740,7 @@ elif page == "Peer Review":
                 if st.button(f"Assign {len(picks)} reviewer(s) to {len(sids)} abstract(s) and email them", type="primary", disabled=not (sids and picks)):
                     okn = sum(bool(run(ev.assign, conn, policy, user, sid, rid, due)) for sid in sids for rid in picks)
                     if okn:
-                        st.success(f"{okn} assignment(s) made; reviewers were emailed.")
+                        done(f"{okn} reviewer assignment(s) made; reviewers were emailed.", "track progress in 3 · Progress")
                         refresh()
     with t3:
         rows = ev.all_assignments(conn, user)
@@ -645,14 +751,15 @@ elif page == "Peer Review":
             b = st.columns(2)
             if b[0].button("📧 Send due / overdue reminders now"):
                 n = run(ev.send_due_reminders, conn, policy, sv.now_utc())
-                st.success(f"{n or 0} reminder(s) queued.") if n is not None else None
+                if n is not None:
+                    done(f"{n or 0} reminder email(s) sent to reviewers.")
             with b[1].form("wd"):
                 openr = [x for x in rows if x["status"].split(" ")[0] in ev.OPEN]
                 if openr:
                     wid = st.selectbox("Withdraw an assignment (to reassign it)", [x["assignment_id"] for x in openr],
                                        format_func=lambda i: next(f"{x['paper']} · {x['reviewer']} · {x['status']}" for x in openr if x["assignment_id"] == i))
                     wr = st.text_input("Reason", "reassigning")
-                    if st.form_submit_button("Withdraw") and run(ev.withdraw, conn, user, wid, wr, ok="Withdrawn; the reviewer was told."):
+                    if st.form_submit_button("Withdraw") and run(ev.withdraw, conn, user, wid, wr, ok="Assignment withdrawn; the reviewer was told.", then="assign another reviewer in 2 · Assign"):
                         refresh()
                 else:
                     st.caption("Nothing open to withdraw.")
@@ -702,7 +809,8 @@ elif page == "Peer Review":
                 share = st.checkbox("Share the reviewers' comments for the team (anonymised as Reviewer 1, 2…)", True)
                 now_rel = st.checkbox("Email the team now (otherwise release later in tab 5, all teams at once)", False)
                 if st.form_submit_button("Record decision", type="primary") and run(ev.decide, conn, policy, user, sid, outc, note, share, now_rel,
-                                                                                     ok="Decision recorded." + (" The team was emailed." if now_rel else "")):
+                                                                                     ok="Evaluation decision recorded." + (" The team was emailed." if now_rel else ""),
+                                                                                             then=None if now_rel else "release results in 5 · Results & release"):
                     refresh()
     with t5:
         board = ev.leaderboard(conn, policy, user)
@@ -719,18 +827,27 @@ elif page == "Peer Review":
             if st.button("📣 Release all pending results", disabled=not (okr and pending), type="primary"):
                 n = run(ev.release, conn, policy, user, None)
                 if n is not None:
-                    st.success(f"Results emailed to {n} team(s).")
+                    done(f"Results released and emailed to {n} team(s).", "teams can now read them on 🏅 Results")
 
 elif page == "Review Queue":
     st.header("Review queue")
     c = st.columns(2)
-    flag = c[0].selectbox("Filter by flag", ["", "SIMILARITY", "NEAR_DUPLICATE", "DUPLICATE_SUBMISSION", "DOMAIN_RELEVANCE", "PS_SIMILARITY", "SEMANTIC_SIMILARITY"])
+    flag = c[0].selectbox("Filter by flag", ["", "GUARDRAIL_INSTRUCTIONS", "GUARDRAIL_HIDDEN_TEXT", "GUARDRAIL_OBFUSCATION", "CONTENT_TECHNICAL",
+                                             "SIMILARITY", "NEAR_DUPLICATE", "DUPLICATE_SUBMISSION", "DOMAIN_RELEVANCE",
+                                             "PS_SIMILARITY", "SEMANTIC_SIMILARITY"])
     only_open = c[1].toggle("Open cases only", True)
     rows = sv.review_queue(conn, user, only_open, flag)
     st.caption(f"{len(rows)} case(s) · deadline {sv.deadline(policy).isoformat()}")
     approved = policy["review"]["approved_rejection_policies"]
     for r in rows:
-        with st.expander(f"#{r['submission_id']} · {r['team_code']} · attempt {r['attempt_no']} · {', '.join(r['reasons'])} · lexical {r['max_lexical']}"):
+        guard = any(x.startswith("GUARDRAIL") for x in r["reasons"])
+        with st.expander(("🛑 " if guard else "") + f"#{r['submission_id']} · {r['team_code']} · attempt {r['attempt_no']} · {', '.join(r['reasons'])} · lexical {r['max_lexical']}"):
+            if guard:
+                st.error("🛑 **Possible manipulation attempt.** The document contains text aimed at the evaluation system (or hidden text). "
+                         "It was not obeyed and not accepted automatically. Read the quoted sentence below before deciding.")
+            elif "CONTENT_TECHNICAL" in r["reasons"]:
+                st.warning("🔎 The content analyser found less technical content than required (e.g. a story or slogans with keywords added). "
+                           "The non-technical sentences are quoted in the evidence below.")
             show_report(sv.report(conn, user, r["submission_id"]))
             if r["case_status"] == "open":
                 with st.form(f"dec{r['submission_id']}"):
@@ -782,7 +899,11 @@ elif page == "Dashboard":
     elif os.environ.get("SPACE_ID") or os.environ.get("PERSIST_DIR"):
         st.error("⚠️ Data is NOT being saved permanently: this server's disk is wiped on restart. "
                  "Add the Space secrets HF_TOKEN and HF_DATA_REPO (HF_SETUP.md, Part D), then restart the Space.")
-    rows_all = stats.entry_rows(conn, user)
+    sv.authorize(conn, user, "admin", action="dashboard")
+    rows_all = _dashboard_rows(conn, user, str(settings.db_path))
+    if st.button("🔄 Refresh numbers", help="Numbers are cached for 30 seconds to keep the dashboard fast"):
+        _dashboard_rows.clear()
+        refresh()
     h = stats.headline(conn, rows_all)
     c = st.columns(6)
     c[0].metric("Teams", h["teams"], help=f"{h['teams_without_ps']} have not locked a problem statement yet")
@@ -841,6 +962,13 @@ elif page == "Dashboard":
             c[0].metric("Review backlog", m["review_backlog"])
             c[1].metric("Avg processing (ms)", m["avg_processing_ms"] or "-")
             c[2].metric("Deadline failures", m["deadline_missed"])
+            fr = conn.execute("SELECT AVG(value), COUNT(*) FROM metrics WHERE name='rag_faithfulness' AND at >= datetime('now', '-30 days')").fetchone()
+            lr = conn.execute("SELECT AVG(value) FROM metrics WHERE name='rag_latency_ms' AND at >= datetime('now', '-30 days')").fetchone()
+            c = st.columns(3)
+            c[0].metric("AI answer faithfulness (30 days)", f"{fr[0]:.0%}" if fr[0] is not None else "—", help=f"{fr[1]} AI answers checked")
+            c[1].metric("AI answer time (30 days)", f"{lr[0] / 1000:.1f} s" if lr[0] is not None else "—")
+            hl = conn.execute("SELECT value FROM metrics WHERE name='eval_hit_at_3' ORDER BY id DESC LIMIT 1").fetchone()
+            c[2].metric("Last Hit@3 evaluation", f"{hl[0]:.2f}" if hl else "—", help="📚 Knowledge Base → Evaluate retrieval")
             for title, key in [("Failed checks", "failed_checks"), ("Blocked uploads (no attempt used)", "blocked_submissions"), ("Emails", "notifications")]:
                 st.markdown(f"**{title}**")
                 if m[key]:
@@ -856,7 +984,38 @@ elif page == "Users":
         role = st.selectbox("Role", ["reviewer", "admin", "student"])
         em = st.text_input("Email (reviewers/admins receive review alerts here)")
         if st.form_submit_button("Create user"):
-            run(sv.admin_create_user, conn, user, un, pw, role, em, policy, ok="User created.")
+            run(sv.admin_create_user, conn, user, un, pw, role, em, policy, ok="User account created; a welcome email was sent.")
+    with st.expander("📥 Import reviewers from Excel / Google Form", expanded=False):
+        st.markdown("Upload the **responses sheet of your Google Form** (Google Sheets → File → Download → *Microsoft Excel (.xlsx)* or *CSV*), "
+                    "or any Excel/CSV with an **Email** column. Columns are recognised automatically: name, email, tracks, topics, "
+                    "maximum abstracts, organisation, designation. Existing reviewers (same email) are updated, not duplicated.")
+        st.download_button("⬇ Download an example sheet (the recommended form questions)", ri.template_xlsx(), "reviewers_template.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        rgen = st.session_state.get("rimp_gen", 0)
+        rf = st.file_uploader("Reviewer sheet (.xlsx or .csv)", type=["xlsx", "csv"], key=f"rimp{rgen}")
+        if rf:
+            prev = run(ri.preview, conn, user, rf.name, rf.getvalue())
+            if prev:
+                st.caption("Columns found: " + ", ".join(f"{k} ← '{v}'" for k, v in prev["columns"].items()))
+                tn = {d["id"]: d["name"] for d in sv.catalog(conn)}
+                st.dataframe(pd.DataFrame([{"Row": r["row"], "Action": {"create": "➕ new", "update": "♻️ update", "skip": "⏭ skip"}[r["action"]],
+                                            "Email": r["email"], "Username": r.get("username", ""), "Name": r.get("name", ""),
+                                            "Tracks": ", ".join(tn.get(t, t) for t in r.get("expertise", [])), "Topics": r.get("topics", ""),
+                                            "Max": r.get("max_load", ""), "Notes": "; ".join(r["issues"])} for r in prev["rows"]]),
+                             hide_index=True, width="stretch")
+                st.write(f"**{prev['create']}** new · **{prev['update']}** updated · **{prev['skip']}** skipped")
+                inv = st.checkbox("Email each new reviewer their username and a temporary password (they must change it at first sign-in)", True)
+                if st.button(f"Import {prev['create'] + prev['update']} reviewer(s)", type="primary", disabled=not (prev["create"] + prev["update"])):
+                    res = run(ri.import_reviewers, conn, policy, user, prev, inv, policy.get("notifications", {}).get("app_url", ""))
+                    if res:
+                        done(f"Reviewers imported: {res['created']} new, {res['updated']} updated, {res['skipped']} skipped."
+                             + (" Invitation emails sent." if inv else ""), "check their tracks in 🎯 Peer Review → 1 · Reviewers")
+                        st.session_state["rimp_creds"] = ri.credentials_csv(res["credentials"])
+                        st.session_state["rimp_gen"] = rgen + 1
+        if st.session_state.get("rimp_creds"):
+            st.download_button("⬇ Download the new usernames and temporary passwords (CSV) — keep it private, delete after use",
+                               st.session_state["rimp_creds"], "reviewer_credentials.csv", "text/csv",
+                               on_click=lambda: st.session_state.pop("rimp_creds", None))
     f = st.columns([2, 1])
     uq = f[0].text_input("Search username, email or team")
     ur = f[1].selectbox("Role filter", ["", "student", "reviewer", "admin"], format_func=lambda x: x or "All roles")
@@ -877,12 +1036,12 @@ elif page == "Users":
             if st.form_submit_button("Save changes", type="primary"):
                 r = run(sv.update_user, conn, policy, user, uid, email=e_email, role=e_role, active=e_active, new_password=e_pw or None)
                 if r:
-                    st.success("Saved: " + ", ".join(r["changed"]) + ". The user was emailed." if r["changed"] else "Nothing changed.")
+                    done("User updated: " + ", ".join(r["changed"]) + ". The user was emailed.") if r["changed"] else st.info("Nothing changed.")
         with st.expander("🗑️ Remove this user"):
             st.caption("Only accounts with no team, submissions, reviews or queries can be deleted. Others can be deactivated above "
                        "(they can no longer sign in, and every record keeps its author).")
             okd = st.checkbox(f"Yes, permanently delete '{cu['username']}'", key=f"del_ok{uid}")
-            if st.button("Delete user", disabled=not okd, key=f"del{uid}") and run(sv.delete_user, conn, user, uid, ok="User deleted."):
+            if st.button("Delete user", disabled=not okd, key=f"del{uid}") and run(sv.delete_user, conn, user, uid, ok="User account deleted."):
                 refresh()
 
 elif page == "Knowledge Base":
@@ -908,17 +1067,86 @@ elif page == "Knowledge Base":
         c[2].write("")
         if c[2].button("Update status") and run(setup.set_kb_status, conn, user, settings.kb_dir, kfile, knew, ok="Status updated. Rebuild the index."):
             refresh()
-    st.markdown("**Models**")
-    st.json(model_status())
+    st.markdown("#### 🧠 Search models")
+    lm = local_models.status()
+    c = st.columns(3)
+    c[0].metric("Meaning-based search", "✅ on" if lm["embed_loaded"] else ("⏳ loading" if lm["enabled"] and not lm["embed_error"] else "⚪ off"),
+                help=lm["embed_model"])
+    c[1].metric("Re-ranking", "✅ on" if lm["rerank_loaded"] else ("⏳ loading" if lm["enabled"] and not lm["rerank_error"] else "⚪ off"),
+                help=lm["rerank_model"])
+    c[2].metric("AI answers", "✅ on" if model_status()["chat_ok"] else "⚪ off (add a key)")
+    if lm["embed_error"] or lm["rerank_error"]:
+        st.warning("A search model could not load, so keyword search is used (everything still works). "
+                   f"{lm['embed_error'] or ''} {lm['rerank_error'] or ''}")
+        if st.button("Retry loading the models"):
+            local_models.reset()
+            refresh()
     stale = HybridIndex.needs_rebuild(settings.kb_dir, settings.index_dir)
-    st.write("Index status:", "⚠️ missing or stale" if stale else "✅ up to date")
-    if st.button("Rebuild index"):
-        ms = model_status()
-        idx = HybridIndex.build(settings.kb_dir, settings.index_dir, client if ms["embed_ok"] else None, policy["rag"]["chunk_words"], policy["rag"]["chunk_overlap"])
+    meta = json.loads((settings.index_dir / "meta.json").read_text()) if (settings.index_dir / "meta.json").exists() else {}
+    st.write("Index:", "⚠️ missing or out of date — rebuild it" if stale else
+             f"✅ up to date · {meta.get('chunks')} passages · {'meaning-based + keyword' if meta.get('semantic') else 'keyword only'}")
+    if meta and not meta.get("semantic") and lm["embed_loaded"]:
+        st.info("The meaning-based search model is ready: rebuild the index to switch it on.")
+    if st.button("Rebuild index", type="primary" if stale else "secondary"):
+        with st.spinner("Indexing…"):
+            emb = local_models.pick_embedder(client)
+            idx = HybridIndex.build(settings.kb_dir, settings.index_dir, emb, policy["rag"]["chunk_words"], policy["rag"]["chunk_overlap"])
+        from rag.answer import clear_cache
+        clear_cache()
         sv.audit(conn, user, "kb_reindexed", details={"chunks": idx.meta["chunks"], "semantic": idx.meta["semantic"]})
-        st.success(f"Indexed {idx.meta['chunks']} chunks · semantic={idx.meta['semantic']}")
-    if (settings.index_dir / "meta.json").exists():
-        st.json(json.loads((settings.index_dir / "meta.json").read_text()))
+        done(f"Knowledge base re-indexed: {idx.meta['chunks']} passages{' with meaning-based search' if idx.meta['semantic'] else ' (keyword search)'}.",
+             "📏 Evaluate retrieval below")
+
+    st.markdown("#### 🔤 Synonyms")
+    st.caption("Words students use that differ from the official documents. One line each: `their word = official word, other word`.")
+    with st.form("syn"):
+        syn_txt = st.text_area("Synonyms", "\n".join(policy["rag"].get("synonyms", [])), height=180)
+        if st.form_submit_button("Save synonyms") and run(setup.update_settings, conn, user, {"rag.synonyms": syn_txt}, base_policy,
+                                                          ok="Synonyms saved.", then="📏 Evaluate retrieval to see the effect"):
+            from rag.answer import clear_cache
+            clear_cache()
+
+    st.markdown("#### 📏 Evaluate retrieval")
+    st.caption("Measures how well the search finds the right passages: **Hit@3** (right document in the top 3), **MRR** (how high it ranks), "
+               "**context recall** (expected facts present in what the AI reads), **faithfulness** (AI sentences supported by their sources).")
+    from evaluation.evaluate import EVAL_CSV_COLUMNS, eval_history, load_items, rag_eval
+    tmpl = ",".join(EVAL_CSV_COLUMNS) + "\nHow many members can a team have?,student,incubation_guidelines.md,two and three members,yes\n" \
+           "What is the prize money?,student,,,no\n"
+    c = st.columns([2, 1])
+    evf = c[0].file_uploader("Your test questions (CSV)", type=["csv"], key="evalcsv",
+                             help="Columns: " + ", ".join(EVAL_CSV_COLUMNS) + ". Separate several documents or facts with ';'.")
+    c[1].download_button("⬇ CSV template", tmpl, "retrieval_test_questions.csv", "text/csv")
+    judge = st.checkbox("Also check AI answer faithfulness (uses AI calls: about one per question)", disabled=not model_status()["chat_ok"])
+    if st.button("Run evaluation"):
+        idx = load_index()
+        if idx is None:
+            st.warning("Rebuild the index first.")
+        else:
+            try:
+                items = load_items(evf.getvalue()) if evf else load_items(ROOT / "evaluation" / "rag_eval.json")
+                with st.spinner(f"Evaluating {len(items)} question(s)…"):
+                    ev_out = rag_eval(idx, items, client if judge else None, 5, policy["rag"], conn, judge_answers=judge, **rag_tools())
+                st.session_state["_eval"] = ev_out
+                done(f"Evaluation finished on {ev_out['n']} question(s) ({'your file' if evf else 'the sample questions'}).")
+            except Exception as exc:
+                st.error(f"Could not run the evaluation: {exc}")
+    if ev_out := st.session_state.get("_eval"):
+        c = st.columns(5)
+        fmt = lambda v: "—" if v is None else f"{v:.2f}"
+        c[0].metric("Hit@3", fmt(ev_out["hit_at_3"]), help="target ≥ 0.90")
+        c[1].metric("MRR", fmt(ev_out["mrr"]), help="target ≥ 0.80")
+        c[2].metric("Context recall", fmt(ev_out["context_recall"]), help="target ≥ 0.85")
+        c[3].metric("Faithfulness", fmt(ev_out["faithfulness"]), help="target ≥ 0.90; needs the AI check box")
+        c[4].metric("Refuses unknowns", fmt(ev_out["unanswerable_abstention_rate"]))
+        st.caption(f"Hit@1 {fmt(ev_out['hit_at_1'])} · Hit@5 {fmt(ev_out['hit_at_5'])} · Recall@5 {fmt(ev_out['recall_at_k'])} · "
+                   f"search: {ev_out['retrieval_mode']} · {ev_out['retrieval_latency_ms_mean']} ms per question")
+        st.dataframe(pd.DataFrame(ev_out["rows"]), hide_index=True, width="stretch")
+        st.download_button("⬇ Results (CSV)", pd.DataFrame(ev_out["rows"]).to_csv(index=False), "retrieval_evaluation.csv", "text/csv")
+    hist = eval_history(conn)
+    if len(hist) > 1:
+        st.markdown("**Trend (last runs)**")
+        hdf = pd.DataFrame(hist[::-1]).set_index("run")
+        st.line_chart(hdf[[c_ for c_ in ("hit_at_3", "mrr", "context_recall", "faithfulness") if c_ in hdf]])
 
 elif page == "Programme Setup":
     sv.authorize(conn, user, "admin", action="programme_setup")
@@ -940,18 +1168,22 @@ elif page == "Programme Setup":
             b = st.columns(5)
             if b[0].button("🧪 Test"):
                 okp, msgp = providers.test_provider(conn, user, pid)
-                (st.success if okp else st.error)(msgp)
+                done(f"AI key tested: {msgp}") if okp else st.error(msgp)
             if b[1].button("⬆ Up"):
                 providers.move_provider(conn, user, pid, True)
+                _LAST_OK.append((f"{cur['name']} moved up.", None))
                 refresh()
             if b[2].button("⬇ Down"):
                 providers.move_provider(conn, user, pid, False)
+                _LAST_OK.append((f"{cur['name']} moved down.", None))
                 refresh()
             if b[3].button("⏸ Pause" if cur["enabled"] else "▶ Use"):
                 providers.update_provider(conn, user, pid, enabled=not cur["enabled"])
+                _LAST_OK.append((f"{cur['name']} {'paused' if cur['enabled'] else 'switched on'}.", None))
                 refresh()
             if b[4].button("🗑 Remove"):
                 providers.delete_provider(conn, user, pid)
+                _LAST_OK.append((f"{cur['name']} key removed.", None))
                 refresh()
             with st.form(f"provupd{pid}"):
                 c = st.columns(2)
@@ -972,7 +1204,7 @@ elif page == "Programme Setup":
             pb = c[1].text_input("API address (OpenAI-compatible)", base_u)
             pm = c[2].text_input("Model", model_u)
             pk = st.text_input("API key", type="password")
-            if st.form_submit_button("Add key", type="primary") and run(providers.add_provider, conn, user, pn, pb, pk, pm, ok="Key added. Click Test to check it."):
+            if st.form_submit_button("Add key", type="primary") and run(providers.add_provider, conn, user, pn, pb, pk, pm, ok="AI key added.", then="select it and click 🧪 Test"):
                 refresh()
     with t6:
         ec = policy["evaluation"]
@@ -1016,7 +1248,8 @@ elif page == "Programme Setup":
             else:
                 st.success(f"Preview: {len({r['track_id'] for r in rows})} track(s), {len(rows)} problem statement(s)")
                 st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-                if st.button("Import catalogue") and run(setup.import_catalogue, conn, user, up.name, up.getvalue(), mode.startswith("Replace"), settings.kb_dir, ok="Catalogue imported."):
+                if st.button("Import catalogue") and run(setup.import_catalogue, conn, user, up.name, up.getvalue(), mode.startswith("Replace"), settings.kb_dir, ok="Catalogue imported.",
+                        then="📚 Knowledge Base → Rebuild index"):
                     st.info("Rebuild the knowledge-base index (Knowledge Base page) so the assistant knows the new tracks.")
         st.markdown("**Current catalogue** (`ps_active = 0` → hidden from new selections; teams that locked it keep it)")
         st.dataframe(cur, hide_index=True, width="stretch")
@@ -1093,8 +1326,28 @@ elif page == "Programme Setup":
             nd = c[1].number_input("Near-duplicate alert at overlap ≥ (0 = off)", 0.0, 1.0, float(dc.get("near_duplicate_threshold") or 0), 0.05)
             bi = c[2].checkbox("Block re-uploading the team's own previous file", dc.get("block_identical_resubmission", True))
             st.caption(f"Similarity above {policy['similarity']['review_threshold']:.0%} with another team's work always goes to human review (never auto-rejected).")
+            ag = policy.get("agents", {})
+            st.markdown("**🤖 Screening agents** — stage 1 is the keyword check above; stage 2 reads the whole abstract")
+            c = st.columns(2)
+            g_on = c[0].checkbox("Guardrail: catch instructions aimed at the evaluator, hidden text (always sent to human review)",
+                                 ag.get("guardrail", {}).get("enabled", True))
+            g_al = c[1].checkbox("Email admins when the guardrail fires", ag.get("guardrail", {}).get("alert_admins", True))
+            cc = ag.get("content", {})
+            c = st.columns(4)
+            ca_on = c[0].checkbox("Content analyser (stage 2): technical content check", cc.get("enabled", True))
+            tp = c[1].number_input("Minimum technical content (%)", 0, 100, int(cc.get("min_technical_percent", 75)), 5)
+            cact = c[2].selectbox("Below the minimum", ["reject", "review"], ["reject", "review"].index(cc.get("action", "reject")),
+                                  format_func=lambda x: {"reject": "Reject (attempt used, reasons emailed)", "review": "Send to human review"}[x])
+            ai_on = c[3].checkbox("Use AI to read the abstract when AI keys are set", cc.get("use_ai", True))
+            st.caption("Stage 2 runs only when the keyword check passes. With AI keys the AI reads the whole abstract and labels every sentence; "
+                       "without them the portal's own reader is used. Students can try **Check my draft** first (no attempt used).")
+            ap = st.checkbox("Assignment agent: propose reviewers automatically when an abstract is accepted (you approve before anything is shared)",
+                             ag.get("assignment", {}).get("auto_propose", True))
             if st.form_submit_button("Save checks"):
                 if run(setup.update_settings, conn, user, {
+                        "agents": {"guardrail": {"enabled": g_on, "alert_admins": g_al},
+                                   "content": {"enabled": ca_on, "min_technical_percent": tp, "action": cact, "use_ai": ai_on},
+                                   "assignment": {"auto_propose": ap}},
                         "validation.relevance": {"min_keyword_matches": rk, "action": ra}, "validation.min_words_per_section": spw,
                         "validation.ps_similarity": {"enabled": pe, "margin": pm, "action": pa},
                         "duplicates": {"exact_action": da, "near_duplicate_threshold": nd or None, "block_identical_resubmission": bi}},
@@ -1145,7 +1398,7 @@ elif page == "Notifications":
                 if not sure:
                     st.warning("Tick the confirmation box first.")
                 elif n := run(sv.send_announcement, conn, policy, user, aud, cat, subj, msg):
-                    st.success(f"Announcement sent to {n} team(s).")
+                    done(f"Announcement sent to {n} team(s).")
     cnt = outbox_counts(conn)
     c = st.columns(4)
     c[0].metric("Queued", cnt.get("queued_local", 0))
@@ -1164,13 +1417,13 @@ elif page == "Notifications":
             if st.button("Discard waiting emails", disabled=not ok_discard):
                 n = run(sv.discard_waiting_emails, conn, user)
                 if n:
-                    st.success(f"{n} email(s) discarded.")
+                    done(f"{n} waiting email(s) discarded.")
                     refresh()
     if c[1].button("Queue due reminders now"):
         n = send_deadline_reminders(conn, policy, sv.deadline(policy), sv.now_utc())
         r = send_review_reminders(conn, policy, sv.now_utc())
         sv.audit(conn, user, "reminders_queued", details={"deadline": n, "review": r})
-        st.success(f"{n} deadline reminder(s) and {r} reviewer reminder(s) queued" + ("" if n or r else " (none due right now)"))
+        done(f"{n} deadline reminder(s) and {r} reviewer reminder(s) sent" + ("" if n or r else " (none due right now)") + ".")
     with c[2].form("test_mail", border=False):
         to = st.text_input("Send a test email to")
         if st.form_submit_button("Send test email") and to:
@@ -1204,11 +1457,13 @@ elif page == "Policy":
         c1.info(f"💾 {ps['message']}")
         if c2.button("Back up now"):
             r = cloud.push(force=True) if cloud.enabled() else persist.backup()
-            st.success(f"Saved: database {'copied' if r.get('db_copied') else 'unchanged'}, {r.get('files_copied', 0)} file(s) copied.")
+            done(f"Backup complete: database {'copied' if r.get('db_copied') else 'unchanged'}, {r.get('files_copied', 0)} file(s) copied.")
     st.caption(f"Edit `{settings.policy_file}` and restart to change rules. Items awaiting administrator confirmation:")
     st.write(policy.get("awaiting_admin_confirmation", []))
     if st.button("Run deadline sweep now"):
-        st.write(f"Marked {run(sv.sweep_deadlines, conn, policy, user)} submission(s) DEADLINE_MISSED.")
+        n_sw = run(sv.sweep_deadlines, conn, policy, user)
+        if n_sw is not None:
+            done(f"Deadline sweep finished: {n_sw if n_sw is not True else 0} submission(s) marked deadline missed.", "🎯 Peer Review → Auto-assign")
     st.json({k: v for k, v in policy.items() if not k.startswith("_")})
 
 elif page == "Queries":
@@ -1245,14 +1500,14 @@ elif page == "Queries":
             st.warning("Rebuild the knowledge-base index first (📚 Knowledge Base).")
         else:
             with st.spinner("Drafting…"):
-                d = run(qs.ai_draft, conn, user, qid, idx, client, policy["rag"])
+                d = run(qs.ai_draft, conn, user, qid, idx, client, policy["rag"], **rag_tools())
             if d:
                 st.session_state[key] = d
     if not model_status()["chat_ok"]:
         st.caption("AI drafting needs an AI key: ⚙️ Programme Setup → AI keys.")
     txt = st.text_area("Your reply (emailed to the sender)", key=key, height=200)
     b = st.columns(4)
-    if b[0].button("Send reply", type="primary") and run(qs.reply, conn, policy, user, qid, txt, ok="Reply sent."):
+    if b[0].button("Send reply", type="primary") and run(qs.reply, conn, policy, user, qid, txt, ok="Reply sent to the sender by email."):
         st.session_state.pop(key, None)
         refresh()
     if b[1].button("Send and close") and run(qs.reply, conn, policy, user, qid, txt, True, ok="Reply sent and query closed."):
@@ -1279,12 +1534,13 @@ elif page == "AI Assistant":
     if q := st.chat_input("Ask about the incubation rules…"):
         with st.chat_message("user"):
             st.markdown(q)
-        res = answer(q, idx, user.role, client if ms["chat_ok"] else None, policy["rag"], conn)
-        body = res["answer"]
-        if res["status"] == "uncited":
-            body = "⚠️ The model's answer could not be verified against cited sources:\n\n" + body
-        body += "".join(f"\n\n> **[{s['tag']}] {s['label']}**  \n> {s['text'][:400]}…" for s in res["sources"])
-        body += f"\n\n_retrieval: {res['mode']} · {res['latency_ms']} ms · status: {res['status']}_"
         with st.chat_message("assistant"):
-            st.markdown(body)
+            ph = st.empty()
+            res = answer(q, idx, user.role, client if ms["chat_ok"] else None, policy["rag"], conn, **rag_tools(),
+                         on_token=lambda t: ph.markdown(t + " ▌"))
+            body = res["answer"]
+            body += "".join(f"\n\n> **[{s['tag']}] {s['label']}**  \n> {s['text'][:400]}…" for s in res["sources"])
+            faith = f" · faithfulness {res['faithfulness']:.0%}" if res.get("faithfulness") is not None else ""
+            body += f"\n\n_search: {res['mode']} · {res['latency_ms']:.0f} ms{' · instant (cached)' if res.get('cached') else ''}{faith}_"
+            ph.markdown(body)
         st.session_state["chat"] += [{"role": "user", "content": q}, {"role": "assistant", "content": body}]

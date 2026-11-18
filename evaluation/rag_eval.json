@@ -1,15 +1,19 @@
 {
-  "note": "Labeled evaluation set for the SAMPLE knowledge base. Replace together with the official KB.",
+  "note": "Labeled evaluation set for the SAMPLE knowledge base. Replace it with your own questions (Knowledge Base -> Evaluate retrieval -> upload CSV). expected_facts = short phrases that must appear in the retrieved passages.",
   "items": [
-    {"q": "How many members can a team have?", "role": "student", "expected_sources": ["incubation_guidelines.md"], "answerable": true},
-    {"q": "Can we change team members after registration?", "role": "student", "expected_sources": ["incubation_guidelines.md", "faq.md"], "answerable": true},
-    {"q": "How many submission attempts does a team get?", "role": "student", "expected_sources": ["submission_policy.md"], "answerable": true},
-    {"q": "What is the submission deadline?", "role": "student", "expected_sources": ["submission_policy.md"], "answerable": true},
-    {"q": "What happens if similarity is above 50 percent?", "role": "student", "expected_sources": ["originality_policy.md", "faq.md"], "answerable": true},
-    {"q": "Which headings must the abstract contain?", "role": "student", "expected_sources": ["incubation_guidelines.md"], "answerable": true},
-    {"q": "Which file formats are accepted?", "role": "student", "expected_sources": ["incubation_guidelines.md", "submission_policy.md"], "answerable": true},
-    {"q": "How should reviewers treat common phrases from the problem statement?", "role": "reviewer", "expected_sources": ["reviewer_guidelines.md"], "answerable": true},
-    {"q": "What is the prize money for the winning team?", "role": "student", "expected_sources": [], "answerable": false},
-    {"q": "Which hotel will host the finale banquet?", "role": "student", "expected_sources": [], "answerable": false}
+    {"q": "How many members can a team have?", "role": "student", "expected_sources": ["incubation_guidelines.md"], "expected_facts": ["between two and three members"], "answerable": true},
+    {"q": "How big can our group be?", "role": "student", "expected_sources": ["incubation_guidelines.md"], "expected_facts": ["two and three members"], "answerable": true},
+    {"q": "Can we change team members after registration?", "role": "student", "expected_sources": ["incubation_guidelines.md", "faq.md"], "expected_facts": ["membership is locked"], "answerable": true},
+    {"q": "How many submission attempts does a team get?", "role": "student", "expected_sources": ["submission_policy.md"], "expected_facts": ["three formal submission attempts"], "answerable": true},
+    {"q": "How many tries do we have to upload the abstract?", "role": "student", "expected_sources": ["submission_policy.md"], "expected_facts": ["three formal submission attempts"], "answerable": true},
+    {"q": "What is the submission deadline?", "role": "student", "expected_sources": ["submission_policy.md"], "expected_facts": ["30 November 2026", "23:59:59"], "answerable": true},
+    {"q": "What is the last date to submit?", "role": "student", "expected_sources": ["submission_policy.md"], "expected_facts": ["30 November 2026"], "answerable": true},
+    {"q": "What happens if similarity is above 50 percent?", "role": "student", "expected_sources": ["originality_policy.md", "faq.md"], "expected_facts": ["flagged for human review"], "answerable": true},
+    {"q": "Which headings must the abstract contain?", "role": "student", "expected_sources": ["incubation_guidelines.md"], "expected_facts": ["Problem Statement / Motivation", "Methodology", "Deliverables / Outcomes"], "answerable": true},
+    {"q": "Which file formats are accepted?", "role": "student", "expected_sources": ["incubation_guidelines.md", "submission_policy.md"], "expected_facts": ["PDF, DOCX and PPTX"], "answerable": true},
+    {"q": "What is the maximum file size?", "role": "student", "expected_sources": ["incubation_guidelines.md"], "expected_facts": ["10 MB"], "answerable": true},
+    {"q": "How should reviewers treat common phrases from the problem statement?", "role": "reviewer", "expected_sources": ["reviewer_guidelines.md"], "expected_facts": ["should not be counted as copying"], "answerable": true},
+    {"q": "What is the prize money for the winning team?", "role": "student", "expected_sources": [], "expected_facts": [], "answerable": false},
+    {"q": "Which hotel will host the finale banquet?", "role": "student", "expected_sources": [], "expected_facts": [], "answerable": false}
   ]
 }

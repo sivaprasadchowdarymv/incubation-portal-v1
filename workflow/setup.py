@@ -49,6 +49,7 @@ EDITABLE = {
     "submission.max_file_mb": "positive_number",
     "submission.allowed_extensions": "extensions",
     "submission.max_problem_statements_per_team": "entries",
+    "rag.synonyms": "synonyms",
     "validation.min_words": "positive_int",
     "validation.max_words": "positive_int",
     "validation.required_sections": "sections",
@@ -60,6 +61,7 @@ EDITABLE = {
     "duplicates": "duplicates",
     "notifications": "notifications",
     "evaluation": "evaluation",
+    "agents": "agents",
 }
 
 
@@ -129,6 +131,14 @@ def _validate_value(kind: str, v):
         return out
     if kind == "template":
         return v
+    if kind == "synonyms":
+        lines = [str(x).strip() for x in (v if isinstance(v, list) else str(v).splitlines()) if str(x).strip()]
+        bad = [x for x in lines if "=" not in x]
+        if bad:
+            raise WorkflowError(f"Each synonym line needs '=' (e.g. 'group = team'): {bad[0]}")
+        if len(lines) > 200:
+            raise WorkflowError("At most 200 synonym lines")
+        return [x[:200] for x in lines]
     if kind == "entries":
         if not 1 <= int(v) <= 5:
             raise WorkflowError("Problem statements per team must be between 1 and 5")
@@ -167,6 +177,18 @@ def _validate_value(kind: str, v):
                 "review_reminder_hours": max(0, min(int(v.get("review_reminder_hours", 24)), 24 * 14)),
                 "app_url": url, "programme_name": str(v.get("programme_name", "Incubation Programme")).strip()[:80] or "Incubation Programme",
                 "query_inbox": inbox}
+    if kind == "agents":
+        g, c, asg = (dict(v.get(k, {})) for k in ("guardrail", "content", "assignment"))
+        pct = float(c.get("min_technical_percent", 75))
+        if not 0 <= pct <= 100:
+            raise WorkflowError("Minimum technical content must be between 0 and 100 %")
+        action = c.get("action", "reject")
+        if action not in ("reject", "review"):
+            raise WorkflowError("Content analyser action must be 'reject' or 'review'")
+        return {"guardrail": {"enabled": bool(g.get("enabled", True)), "alert_admins": bool(g.get("alert_admins", True))},
+                "content": {"enabled": bool(c.get("enabled", True)), "min_technical_percent": pct, "action": action,
+                            "use_ai": bool(c.get("use_ai", True))},
+                "assignment": {"auto_propose": bool(asg.get("auto_propose", True))}}
     if kind == "evaluation":
         from workflow.evaluation import clean_evaluation_settings
         return clean_evaluation_settings(v)
